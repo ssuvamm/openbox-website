@@ -1,0 +1,1638 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenBox — Your private cloud. One command.</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg: #08080c;
+      --bg-2: #0e0e14;
+      --bg-3: #14141c;
+      --bg-4: #1a1a26;
+      --text: #f0f0f8;
+      --text-2: #a8a8c0;
+      --text-3: #686888;
+      --accent: #7c5cff;
+      --accent-2: #9d7fff;
+      --accent-glow: rgba(124, 92, 255, 0.3);
+      --cyan: #22d3ee;
+      --green: #34d399;
+      --border: rgba(255,255,255,0.06);
+      --border-2: rgba(255,255,255,0.1);
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      overflow-x: hidden;
+      line-height: 1.6;
+    }
+
+    /* Custom scrollbar */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--accent); border-radius: 3px; }
+
+    /* Particle canvas */
+    #particles {
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* Noise texture overlay */
+    body::before {
+      content: '';
+      position: fixed;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)' opacity='0.03'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 1;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 0 24px;
+      position: relative;
+      z-index: 2;
+    }
+
+    /* ========== NAV ========== */
+    nav {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 1000;
+      padding: 16px 0;
+      background: rgba(8, 8, 12, 0.8);
+      backdrop-filter: blur(20px);
+      -webkit-backdrop-filter: blur(20px);
+      border-bottom: 1px solid var(--border);
+      transition: all 0.3s ease;
+    }
+
+    nav.scrolled {
+      background: rgba(8, 8, 12, 0.95);
+    }
+
+    nav .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 20px;
+      font-weight: 700;
+      color: var(--text);
+      text-decoration: none;
+      letter-spacing: -0.5px;
+    }
+
+    .nav-logo-icon {
+      width: 32px;
+      height: 32px;
+      background: linear-gradient(135deg, var(--accent), var(--cyan));
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+      box-shadow: 0 0 20px var(--accent-glow);
+      animation: pulse-glow 3s ease-in-out infinite;
+    }
+
+    @keyframes pulse-glow {
+      0%, 100% { box-shadow: 0 0 20px var(--accent-glow); }
+      50% { box-shadow: 0 0 40px rgba(124, 92, 255, 0.5); }
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+    }
+
+    .nav-links a {
+      color: var(--text-2);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover { color: var(--text); }
+
+    .nav-cta {
+      padding: 8px 20px;
+      background: var(--accent);
+      color: #fff !important;
+      border-radius: 8px;
+      font-weight: 600 !important;
+      transition: all 0.2s !important;
+      box-shadow: 0 0 20px var(--accent-glow);
+    }
+
+    .nav-cta:hover {
+      background: var(--accent-2);
+      transform: translateY(-1px);
+      box-shadow: 0 4px 30px var(--accent-glow);
+    }
+
+    .mobile-toggle {
+      display: none;
+      background: none;
+      border: none;
+      color: var(--text);
+      font-size: 24px;
+      cursor: pointer;
+    }
+
+    /* ========== HERO ========== */
+    .hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      padding: 120px 0 80px;
+      position: relative;
+    }
+
+    .hero-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 80px;
+      align-items: center;
+    }
+
+    .hero-content { animation: fadeInUp 0.8s ease forwards; }
+
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(30px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      background: rgba(124, 92, 255, 0.15);
+      border: 1px solid rgba(124, 92, 255, 0.3);
+      border-radius: 999px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--accent-2);
+      margin-bottom: 24px;
+      animation: fadeInUp 0.8s ease 0.1s forwards;
+      opacity: 0;
+    }
+
+    .hero-badge .dot {
+      width: 6px; height: 6px;
+      background: var(--green);
+      border-radius: 50%;
+      animation: blink 2s ease-in-out infinite;
+    }
+
+    @keyframes blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.3; }
+    }
+
+    .hero h1 {
+      font-size: clamp(48px, 6vw, 72px);
+      font-weight: 800;
+      line-height: 1.0;
+      letter-spacing: -2px;
+      margin-bottom: 24px;
+      animation: fadeInUp 0.8s ease 0.2s forwards;
+      opacity: 0;
+    }
+
+    .hero h1 .gradient-text {
+      background: linear-gradient(135deg, var(--accent), var(--cyan), var(--accent-2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      background-size: 200% 200%;
+      animation: gradient-shift 4s ease infinite;
+    }
+
+    @keyframes gradient-shift {
+      0%, 100% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+    }
+
+    .hero p {
+      font-size: 18px;
+      color: var(--text-2);
+      line-height: 1.7;
+      max-width: 480px;
+      margin-bottom: 40px;
+      animation: fadeInUp 0.8s ease 0.3s forwards;
+      opacity: 0;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      animation: fadeInUp 0.8s ease 0.4s forwards;
+      opacity: 0;
+    }
+
+    .btn-primary {
+      padding: 14px 28px;
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.3s;
+      box-shadow: 0 0 30px var(--accent-glow);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .btn-primary::before {
+      content: '';
+      position: absolute;
+      top: 0; left: -100%;
+      width: 100%; height: 100%;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.15), transparent);
+      transition: left 0.5s;
+    }
+
+    .btn-primary:hover::before { left: 100%; }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 8px 40px var(--accent-glow);
+    }
+
+    .btn-secondary {
+      padding: 14px 28px;
+      background: rgba(255,255,255,0.04);
+      color: var(--text);
+      border: 1px solid var(--border-2);
+      border-radius: 10px;
+      font-size: 15px;
+      font-weight: 500;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.3s;
+      backdrop-filter: blur(10px);
+    }
+
+    .btn-secondary:hover {
+      background: rgba(255,255,255,0.08);
+      border-color: rgba(255,255,255,0.2);
+      transform: translateY(-2px);
+    }
+
+    /* Terminal */
+    .hero-terminal {
+      animation: fadeInUp 0.8s ease 0.5s forwards;
+      opacity: 0;
+    }
+
+    .terminal {
+      background: var(--bg-2);
+      border: 1px solid var(--border-2);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 20px 80px rgba(0,0,0,0.5), 0 0 60px rgba(124, 92, 255, 0.1);
+      position: relative;
+    }
+
+    .terminal-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 18px;
+      background: var(--bg-3);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .terminal-dot {
+      width: 12px; height: 12px;
+      border-radius: 50%;
+    }
+    .terminal-dot.red { background: #ff5f56; }
+    .terminal-dot.yellow { background: #ffbd2e; }
+    .terminal-dot.green { background: #27ca40; }
+
+    .terminal-title {
+      flex: 1;
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-3);
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    .terminal-body {
+      padding: 20px;
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13px;
+      line-height: 1.8;
+    }
+
+    .terminal-line { display: flex; align-items: flex-start; gap: 8px; }
+    .terminal-prompt { color: var(--accent); user-select: none; }
+    .terminal-command { color: var(--text); }
+    .terminal-output { color: var(--text-2); }
+    .terminal-success { color: var(--green); }
+    .terminal-warning { color: #fbbf24; }
+    .terminal-cursor {
+      display: inline-block;
+      width: 8px; height: 16px;
+      background: var(--accent);
+      animation: cursor-blink 1s step-end infinite;
+      vertical-align: middle;
+      margin-left: 2px;
+    }
+
+    @keyframes cursor-blink {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0; }
+    }
+
+    .typing-line {
+      overflow: hidden;
+      white-space: nowrap;
+      animation: typing 0.5s steps(40, end) forwards;
+    }
+
+    @keyframes typing {
+      from { width: 0; }
+      to { width: 100%; }
+    }
+
+    /* Stats row */
+    .hero-stats {
+      display: flex;
+      gap: 40px;
+      margin-top: 48px;
+      padding-top: 32px;
+      border-top: 1px solid var(--border);
+      animation: fadeInUp 0.8s ease 0.6s forwards;
+      opacity: 0;
+    }
+
+    .stat { text-align: left; }
+    .stat-num {
+      font-size: 28px;
+      font-weight: 700;
+      color: var(--text);
+      letter-spacing: -0.5px;
+    }
+    .stat-label {
+      font-size: 13px;
+      color: var(--text-3);
+      margin-top: 2px;
+    }
+
+    /* ========== SECTION HEADER ========== */
+    .section-header {
+      text-align: center;
+      margin-bottom: 64px;
+    }
+
+    .section-label {
+      display: inline-block;
+      padding: 6px 14px;
+      background: rgba(124, 92, 255, 0.1);
+      border: 1px solid rgba(124, 92, 255, 0.2);
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--accent-2);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 16px;
+    }
+
+    .section-header h2 {
+      font-size: clamp(32px, 4vw, 48px);
+      font-weight: 700;
+      letter-spacing: -1px;
+      line-height: 1.2;
+      margin-bottom: 16px;
+    }
+
+    .section-header p {
+      font-size: 17px;
+      color: var(--text-2);
+      max-width: 560px;
+      margin: 0 auto;
+    }
+
+    /* ========== FEATURES ========== */
+    section { padding: 100px 0; }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+    }
+
+    .feature-card {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      transition: all 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+      position: relative;
+      overflow: hidden;
+      cursor: default;
+    }
+
+    .feature-card::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent), transparent);
+      opacity: 0;
+      transition: opacity 0.4s;
+    }
+
+    .feature-card:hover {
+      transform: translateY(-4px);
+      border-color: var(--border-2);
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3), 0 0 40px rgba(124, 92, 255, 0.08);
+    }
+
+    .feature-card:hover::before { opacity: 1; }
+
+    .feature-icon {
+      width: 48px; height: 48px;
+      background: rgba(124, 92, 255, 0.1);
+      border: 1px solid rgba(124, 92, 255, 0.2);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      margin-bottom: 16px;
+      color: var(--accent-2);
+      transition: all 0.3s;
+    }
+
+    .feature-card:hover .feature-icon {
+      background: rgba(124, 92, 255, 0.2);
+      box-shadow: 0 0 20px var(--accent-glow);
+      transform: scale(1.1);
+    }
+
+    .feature-card h3 {
+      font-size: 17px;
+      font-weight: 600;
+      margin-bottom: 8px;
+      letter-spacing: -0.2px;
+    }
+
+    .feature-card p {
+      font-size: 14px;
+      color: var(--text-2);
+      line-height: 1.6;
+    }
+
+    /* ========== MODULES SHOWCASE ========== */
+    .modules-section {
+      background: linear-gradient(180deg, var(--bg) 0%, var(--bg-2) 50%, var(--bg) 100%);
+      position: relative;
+    }
+
+    .modules-showcase {
+      position: relative;
+    }
+
+    .modules-visual {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 60px;
+      align-items: center;
+    }
+
+    .modules-list {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+
+    .module-item {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 16px;
+      background: var(--bg-3);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      transition: all 0.3s;
+      cursor: default;
+    }
+
+    .module-item:hover {
+      background: var(--bg-4);
+      border-color: var(--accent);
+      transform: translateX(4px);
+      box-shadow: 0 4px 20px rgba(124, 92, 255, 0.1);
+    }
+
+    .module-icon-sm {
+      width: 32px; height: 32px;
+      background: rgba(124, 92, 255, 0.1);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      color: var(--accent-2);
+      flex-shrink: 0;
+    }
+
+    .module-info { flex: 1; }
+    .module-name { font-size: 13px; font-weight: 600; }
+    .module-cat { font-size: 11px; color: var(--text-3); }
+
+    /* Dashboard mockup */
+    .dashboard-mockup {
+      background: var(--bg-3);
+      border: 1px solid var(--border-2);
+      border-radius: 16px;
+      overflow: hidden;
+      box-shadow: 0 30px 100px rgba(0,0,0,0.4);
+      position: relative;
+    }
+
+    .mockup-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 20px;
+      background: var(--bg-4);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .mockup-dots { display: flex; gap: 6px; }
+    .mockup-dots span {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: var(--text-3);
+    }
+
+    .mockup-url {
+      font-size: 12px;
+      color: var(--text-3);
+      font-family: 'JetBrains Mono', monospace;
+      background: var(--bg-2);
+      padding: 4px 12px;
+      border-radius: 6px;
+    }
+
+    .mockup-body {
+      padding: 24px;
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      gap: 20px;
+      min-height: 300px;
+    }
+
+    .mockup-sidebar { display: flex; flex-direction: column; gap: 8px; }
+    .mockup-nav-item {
+      padding: 8px 12px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: var(--text-2);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s;
+    }
+
+    .mockup-nav-item.active {
+      background: rgba(124, 92, 255, 0.15);
+      color: var(--accent-2);
+    }
+
+    .mockup-content { display: flex; flex-direction: column; gap: 12px; }
+    .mockup-card {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 16px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .mockup-card-icon {
+      width: 36px; height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 16px;
+    }
+
+    .mockup-card-text { flex: 1; }
+    .mockup-card-name { font-size: 13px; font-weight: 600; }
+    .mockup-card-status { font-size: 11px; color: var(--green); }
+
+    /* ========== INSTALL SECTION ========== */
+    .install-section {
+      background: linear-gradient(135deg, var(--bg-2) 0%, var(--bg-3) 100%);
+      position: relative;
+      overflow: hidden;
+    }
+
+    .install-section::before {
+      content: '';
+      position: absolute;
+      top: -50%;
+      left: -50%;
+      width: 200%;
+      height: 200%;
+      background: radial-gradient(circle at 30% 50%, rgba(124, 92, 255, 0.08) 0%, transparent 50%);
+      animation: rotate-bg 20s linear infinite;
+    }
+
+    @keyframes rotate-bg {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
+    }
+
+    .install-box {
+      max-width: 720px;
+      margin: 0 auto;
+      text-align: center;
+      position: relative;
+    }
+
+    .install-command {
+      background: #000;
+      border: 1px solid var(--border-2);
+      border-radius: 12px;
+      padding: 24px 32px;
+      margin: 32px 0;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .install-command::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0; right: 0;
+      height: 2px;
+      background: linear-gradient(90deg, var(--accent), var(--cyan), var(--accent));
+      background-size: 200% 100%;
+      animation: gradient-shift 3s linear infinite;
+    }
+
+    .install-command code {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 16px;
+      color: var(--green);
+      display: block;
+    }
+
+    .copy-btn {
+      position: absolute;
+      right: 16px;
+      top: 50%;
+      transform: translateY(-50%);
+      background: rgba(255,255,255,0.05);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      color: var(--text-2);
+      cursor: pointer;
+      font-size: 14px;
+      transition: all 0.2s;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .copy-btn:hover {
+      background: rgba(255,255,255,0.1);
+      color: var(--text);
+    }
+
+    .install-features {
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      flex-wrap: wrap;
+      margin-top: 40px;
+    }
+
+    .install-feature {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 14px;
+      color: var(--text-2);
+    }
+
+    .install-feature i {
+      color: var(--green);
+      font-size: 12px;
+    }
+
+    /* ========== TESTIMONIALS ========== */
+    .testimonials-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+    }
+
+    .testimonial-card {
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 28px;
+      position: relative;
+    }
+
+    .testimonial-quote {
+      font-size: 32px;
+      color: var(--accent);
+      margin-bottom: 16px;
+      line-height: 1;
+    }
+
+    .testimonial-text {
+      font-size: 15px;
+      color: var(--text-2);
+      line-height: 1.7;
+      margin-bottom: 20px;
+      font-style: italic;
+    }
+
+    .testimonial-author {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .testimonial-avatar {
+      width: 40px; height: 40px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, var(--accent), var(--cyan));
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 14px;
+    }
+
+    .testimonial-name {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .testimonial-handle {
+      font-size: 12px;
+      color: var(--text-3);
+    }
+
+    /* ========== FOOTER ========== */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 60px 0 40px;
+    }
+
+    .footer-grid {
+      display: grid;
+      grid-template-columns: 2fr 1fr 1fr 1fr;
+      gap: 40px;
+      margin-bottom: 48px;
+    }
+
+    .footer-brand {
+      max-width: 320px;
+    }
+
+    .footer-brand p {
+      font-size: 14px;
+      color: var(--text-2);
+      margin-top: 12px;
+      line-height: 1.7;
+    }
+
+    .footer-col h4 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-3);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 16px;
+    }
+
+    .footer-col a {
+      display: block;
+      color: var(--text-2);
+      text-decoration: none;
+      font-size: 14px;
+      margin-bottom: 10px;
+      transition: color 0.2s;
+    }
+
+    .footer-col a:hover { color: var(--text); }
+
+    .footer-bottom {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 32px;
+      border-top: 1px solid var(--border);
+    }
+
+    .footer-bottom p {
+      font-size: 13px;
+      color: var(--text-3);
+    }
+
+    .footer-social {
+      display: flex;
+      gap: 16px;
+    }
+
+    .footer-social a {
+      width: 36px; height: 36px;
+      background: var(--bg-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-2);
+      text-decoration: none;
+      transition: all 0.3s;
+    }
+
+    .footer-social a:hover {
+      background: rgba(124, 92, 255, 0.2);
+      border-color: var(--accent);
+      color: var(--accent-2);
+      transform: translateY(-2px);
+    }
+
+    /* ========== SCROLL ANIMATIONS ========== */
+    .reveal {
+      opacity: 0;
+      transform: translateY(40px);
+      transition: all 0.8s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    .reveal-delay-1 { transition-delay: 0.1s; }
+    .reveal-delay-2 { transition-delay: 0.2s; }
+    .reveal-delay-3 { transition-delay: 0.3s; }
+    .reveal-delay-4 { transition-delay: 0.4s; }
+    .reveal-delay-5 { transition-delay: 0.5s; }
+
+    /* ========== FLOATING ELEMENTS ========== */
+    .float-element {
+      position: absolute;
+      border-radius: 50%;
+      pointer-events: none;
+      filter: blur(60px);
+      opacity: 0.4;
+    }
+
+    .float-1 {
+      width: 300px; height: 300px;
+      background: var(--accent);
+      top: 10%; right: -100px;
+      animation: float-1 8s ease-in-out infinite;
+    }
+
+    .float-2 {
+      width: 200px; height: 200px;
+      background: var(--cyan);
+      bottom: 20%; left: -50px;
+      animation: float-2 10s ease-in-out infinite;
+    }
+
+    @keyframes float-1 {
+      0%, 100% { transform: translate(0, 0); }
+      50% { transform: translate(-20px, 30px); }
+    }
+
+    @keyframes float-2 {
+      0%, 100% { transform: translate(0, 0); }
+      50% { transform: translate(30px, -20px); }
+    }
+
+    /* ========== MOBILE RESPONSIVE ========== */
+    @media (max-width: 1024px) {
+      .hero-grid { grid-template-columns: 1fr; gap: 48px; }
+      .hero-terminal { display: none; }
+      .features-grid { grid-template-columns: repeat(2, 1fr); }
+      .modules-visual { grid-template-columns: 1fr; }
+      .footer-grid { grid-template-columns: 1fr 1fr; }
+      .testimonials-grid { grid-template-columns: 1fr; }
+    }
+
+    @media (max-width: 768px) {
+      .nav-links { display: none; }
+      .mobile-toggle { display: block; }
+      .features-grid { grid-template-columns: 1fr; }
+      .modules-list { grid-template-columns: 1fr; }
+      .hero-stats { gap: 24px; flex-wrap: wrap; }
+      .footer-grid { grid-template-columns: 1fr; }
+      .footer-bottom { flex-direction: column; gap: 16px; }
+      .hero h1 { letter-spacing: -1px; }
+      .install-features { gap: 16px; }
+    }
+
+    /* Mobile menu */
+    .mobile-menu {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      background: rgba(8, 8, 12, 0.98);
+      backdrop-filter: blur(20px);
+      z-index: 999;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 32px;
+      transform: translateX(100%);
+      transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+    }
+
+    .mobile-menu.open { transform: translateX(0); }
+
+    .mobile-menu a {
+      font-size: 28px;
+      font-weight: 600;
+      color: var(--text);
+      text-decoration: none;
+    }
+
+    .mobile-close {
+      position: absolute;
+      top: 20px; right: 24px;
+      background: none;
+      border: none;
+      color: var(--text);
+      font-size: 28px;
+      cursor: pointer;
+    }
+
+    /* Stagger animations for children */
+    .stagger-children .feature-card:nth-child(1) { animation-delay: 0.1s; }
+    .stagger-children .feature-card:nth-child(2) { animation-delay: 0.2s; }
+    .stagger-children .feature-card:nth-child(3) { animation-delay: 0.3s; }
+    .stagger-children .feature-card:nth-child(4) { animation-delay: 0.4s; }
+    .stagger-children .feature-card:nth-child(5) { animation-delay: 0.5s; }
+    .stagger-children .feature-card:nth-child(6) { animation-delay: 0.6s; }
+    .stagger-children .module-item:nth-child(1) { animation-delay: 0.05s; }
+    .stagger-children .module-item:nth-child(2) { animation-delay: 0.1s; }
+    .stagger-children .module-item:nth-child(3) { animation-delay: 0.15s; }
+    .stagger-children .module-item:nth-child(4) { animation-delay: 0.2s; }
+    .stagger-children .module-item:nth-child(5) { animation-delay: 0.25s; }
+    .stagger-children .module-item:nth-child(6) { animation-delay: 0.3s; }
+    .stagger-children .module-item:nth-child(7) { animation-delay: 0.35s; }
+    .stagger-children .module-item:nth-child(8) { animation-delay: 0.4s; }
+  </style>
+</head>
+<body>
+
+<canvas id="particles"></canvas>
+
+<!-- Navigation -->
+<nav id="navbar">
+  <div class="container">
+    <a href="#" class="nav-logo">
+      <div class="nav-logo-icon">⬡</div>
+      OpenBox
+    </a>
+    <div class="nav-links">
+      <a href="#features">Features</a>
+      <a href="#modules">Modules</a>
+      <a href="docs.html">Docs</a>
+      <a href="changelog.html">Changelog</a>
+      <a href="#install" class="nav-cta">Get Started</a>
+    </div>
+    <button class="mobile-toggle" onclick="toggleMobile()">
+      <i class="fas fa-bars"></i>
+    </button>
+  </div>
+</nav>
+
+<!-- Mobile Menu -->
+<div class="mobile-menu" id="mobileMenu">
+  <button class="mobile-close" onclick="toggleMobile()">×</button>
+  <a href="#features" onclick="toggleMobile()">Features</a>
+  <a href="#modules" onclick="toggleMobile()">Modules</a>
+  <a href="docs.html" onclick="toggleMobile()">Docs</a>
+  <a href="changelog.html" onclick="toggleMobile()">Changelog</a>
+  <a href="#install" class="nav-cta" onclick="toggleMobile()">Get Started</a>
+</div>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="float-element float-1"></div>
+  <div class="float-element float-2"></div>
+  <div class="container">
+    <div class="hero-grid">
+      <div class="hero-content">
+        <div class="hero-badge">
+          <span class="dot"></span>
+          Free for personal use
+        </div>
+        <h1>Your private cloud.<br><span class="gradient-text">One command.</span></h1>
+        <p>Deploy 42 self-hosted apps in minutes. Media streaming, productivity, privacy tools — all behind your own firewall, fully under your control.</p>
+        <div class="hero-actions">
+          <a href="#install" class="btn-primary">
+            <i class="fas fa-terminal"></i>
+            curl -fsSL openbox.crushcodeworks.com/install.sh | bash
+          </a>
+          <a href="#modules" class="btn-secondary">
+            <i class="fas fa-play"></i>
+            See all modules
+          </a>
+        </div>
+        <div class="hero-stats">
+          <div class="stat">
+            <div class="stat-num" data-count="42">0</div>
+            <div class="stat-label">Self-hosted apps</div>
+          </div>
+          <div class="stat">
+            <div class="stat-num" data-count="5">0</div>
+            <div class="stat-label">Linux distros supported</div>
+          </div>
+          <div class="stat">
+            <div class="stat-num" data-count="0" data-suffix="MB">1.1</div>
+            <div class="stat-label">Install size</div>
+          </div>
+        </div>
+      </div>
+      <div class="hero-terminal">
+        <div class="terminal">
+          <div class="terminal-bar">
+            <span class="terminal-dot red"></span>
+            <span class="terminal-dot yellow"></span>
+            <span class="terminal-dot green"></span>
+            <span class="terminal-title">openbox — bash</span>
+          </div>
+          <div class="terminal-body">
+            <div class="terminal-line">
+              <span class="terminal-prompt">$</span>
+              <span class="terminal-command">curl -fsSL openbox.crushcodeworks.com/install.sh | bash</span>
+            </div>
+            <br>
+            <div class="terminal-line">
+              <span class="terminal-output">Downloading OpenBox v1.6.105...</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-success">✓ SHA256 verified</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-success">✓ ed25519 signature verified</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-output">Detected: Ubuntu 22.04 LTS</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-output">Installing Docker...</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-success">✓ Docker installed: v27.3.1</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-output">Setting up firewall (UFW)...</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-success">✓ Firewall configured</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-success">✓ OpenBox installed to /opt/openbox</span>
+            </div>
+            <br>
+            <div class="terminal-line">
+              <span class="terminal-output">Dashboard: http://192.168.1.100:8443</span>
+            </div>
+            <div class="terminal-line">
+              <span class="terminal-output">Bootstrap token: </span>
+              <span class="terminal-warning">a3f2b19c8d4e</span>
+            </div>
+            <br>
+            <div class="terminal-line">
+              <span class="terminal-prompt">$</span>
+              <span class="terminal-cursor"></span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section id="features">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="section-label">Why OpenBox</span>
+      <h2>Everything you need,<br>nothing you don't.</h2>
+      <p>Built for people who want power without complexity. OpenBox handles the hard part so you can focus on what matters.</p>
+    </div>
+    <div class="features-grid stagger-children">
+      <div class="feature-card reveal">
+        <div class="feature-icon"><i class="fas fa-shield-halved"></i></div>
+        <h3>100% Private</h3>
+        <p>All your data stays on your hardware. No cloud dependencies, no subscription fees, no tracking.</p>
+      </div>
+      <div class="feature-card reveal reveal-delay-1">
+        <div class="feature-icon"><i class="fas fa-bolt"></i></div>
+        <h3>One-Command Install</h3>
+        <p>curl the installer and go. Docker, firewall, SSL — everything configured automatically.</p>
+      </div>
+      <div class="feature-card reveal reveal-delay-2">
+        <div class="feature-icon"><i class="fas fa-arrows-rotate"></i></div>
+        <h3>Auto-Updates + Rollback</h3>
+        <p>Stay current without breaking things. Every update is atomic — if it fails, you're back in seconds.</p>
+      </div>
+      <div class="feature-card reveal reveal-delay-1">
+        <div class="feature-icon"><i class="fas fa-server"></i></div>
+        <h3>NAS + VPS Compatible</h3>
+        <p>UGREEN NAS, Synology, Raspberry Pi, or any VPS. One installer handles them all.</p>
+      </div>
+      <div class="feature-card reveal reveal-delay-2">
+        <div class="feature-icon"><i class="fas fa-film"></i></div>
+        <h3>Media Stack Built-In</h3>
+        <p>Sonarr, Radarr, Prowlarr, Jellyfin, qBittorrent — all pre-wired and auto-configured on day one.</p>
+      </div>
+      <div class="feature-card reveal reveal-delay-3">
+        <div class="feature-icon"><i class="fas fa-lock"></i></div>
+        <h3>Signed + Verified</h3>
+        <p>Every release is SHA256-hashed and ed25519-signed. Supply-chain tamper detection built in.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon"><i class="fas fa-network-wired"></i></div>
+        <h3>VPN Optional</h3>
+        <p>Media stack works with or without VPN. Enable VPN for encrypted torrent traffic, skip it for local networks.</p>
+      </div>
+      <div class="feature-card reveal reveal-delay-1">
+        <div class="feature-icon"><i class="fas fa-gauge-high"></i></div>
+        <h3>Web Dashboard</h3>
+        <p>Enable, disable, and manage every module from a beautiful web UI. No command-line required.</p>
+      </div>
+      <div class="feature-card reveal reveal-delay-2">
+        <div class="feature-icon"><i class="fas fa-plug"></i></div>
+        <h3>42+ Modules</h3>
+        <p>From Jellyfin to Nextcloud, Vaultwarden to Immich — pick what you need, skip what you don't.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Modules -->
+<section id="modules" class="modules-section">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="section-label">42 Modules</span>
+      <h2>Your complete self-hosted stack.</h2>
+      <p>Every app you'd want to self-host, pre-configured and ready to go. Enable with one click.</p>
+    </div>
+    <div class="modules-visual reveal">
+      <div class="modules-list stagger-children">
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-film"></i></div>
+          <div class="module-info">
+            <div class="module-name">Media Center</div>
+            <div class="module-cat">Jellyfin · Sonarr · Radarr</div>
+          </div>
+        </div>
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-cloud"></i></div>
+          <div class="module-info">
+            <div class="module-name">Cloud Drive</div>
+            <div class="module-cat">Nextcloud · File Browser</div>
+          </div>
+        </div>
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-shield"></i></div>
+          <div class="module-info">
+            <div class="module-name">Privacy Stack</div>
+            <div class="module-cat">Pi-hole · Vaultwarden · AdGuard</div>
+          </div>
+        </div>
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-robot"></i></div>
+          <div class="module-info">
+            <div class="module-name">AI & Automation</div>
+            <div class="module-cat">Ollama · n8n · LocalAI</div>
+          </div>
+        </div>
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-database"></i></div>
+          <div class="module-info">
+            <div class="module-name">Development</div>
+            <div class="module-cat">Gitea · PostgreSQL · Redis</div>
+          </div>
+        </div>
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-chart-line"></i></div>
+          <div class="module-info">
+            <div class="module-name">Monitoring</div>
+            <div class="module-cat">Grafana · Uptime Kuma</div>
+          </div>
+        </div>
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-lock"></i></div>
+          <div class="module-info">
+            <div class="module-name">VPN & Remote</div>
+            <div class="module-cat">WireGuard · Tailscale</div>
+          </div>
+        </div>
+        <div class="module-item">
+          <div class="module-icon-sm"><i class="fas fa-book"></i></div>
+          <div class="module-info">
+            <div class="module-name">Knowledge</div>
+            <div class="module-cat">BookStack · Linkding</div>
+          </div>
+        </div>
+      </div>
+      <div class="dashboard-mockup reveal reveal-delay-2">
+        <div class="mockup-bar">
+          <div class="mockup-dots">
+            <span></span><span></span><span></span>
+          </div>
+          <span class="mockup-url">http://localhost:8443</span>
+        </div>
+        <div class="mockup-body">
+          <div class="mockup-sidebar">
+            <div class="mockup-nav-item active">
+              <i class="fas fa-grip"></i>
+              <span style="font-size:10px">Dashboard</span>
+            </div>
+            <div class="mockup-nav-item">
+              <i class="fas fa-rocket"></i>
+              <span style="font-size:10px">Apps</span>
+            </div>
+            <div class="mockup-nav-item">
+              <i class="fas fa-cog"></i>
+              <span style="font-size:10px">Settings</span>
+            </div>
+          </div>
+          <div class="mockup-content">
+            <div class="mockup-card" style="border-left: 3px solid #7c5cff;">
+              <div class="mockup-card-icon" style="background: rgba(124,92,255,0.2); color: #9d7fff;">
+                <i class="fas fa-server"></i>
+              </div>
+              <div class="mockup-card-text">
+                <div class="mockup-card-name">Media Center</div>
+                <div class="mockup-card-status">● Running</div>
+              </div>
+              <i class="fas fa-toggle-on" style="color: #34d399;"></i>
+            </div>
+            <div class="mockup-card" style="border-left: 3px solid #22d3ee;">
+              <div class="mockup-card-icon" style="background: rgba(34,211,238,0.2); color: #22d3ee;">
+                <i class="fas fa-cloud"></i>
+              </div>
+              <div class="mockup-card-text">
+                <div class="mockup-card-name">Cloud Drive</div>
+                <div class="mockup-card-status">● Running</div>
+              </div>
+              <i class="fas fa-toggle-on" style="color: #34d399;"></i>
+            </div>
+            <div class="mockup-card" style="border-left: 3px solid #fbbf24;">
+              <div class="mockup-card-icon" style="background: rgba(251,191,36,0.2); color: #fbbf24;">
+                <i class="fas fa-shield-halved"></i>
+              </div>
+              <div class="mockup-card-text">
+                <div class="mockup-card-name">Privacy Stack</div>
+                <div class="mockup-card-status">○ Stopped</div>
+              </div>
+              <i class="fas fa-toggle-off" style="color: var(--text-3);"></i>
+            </div>
+            <div class="mockup-card" style="border-left: 3px solid #34d399;">
+              <div class="mockup-card-icon" style="background: rgba(52,211,153,0.2); color: #34d399;">
+                <i class="fas fa-robot"></i>
+              </div>
+              <div class="mockup-card-text">
+                <div class="mockup-card-name">AI Stack</div>
+                <div class="mockup-card-status">● Running</div>
+              </div>
+              <i class="fas fa-toggle-on" style="color: #34d399;"></i>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Install -->
+<section id="install" class="install-section">
+  <div class="float-element float-1"></div>
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="section-label">Get Started</span>
+      <h2>Up and running in 60 seconds.</h2>
+      <p>One command. Any Linux box. No manual configuration required.</p>
+    </div>
+    <div class="install-box reveal">
+      <div class="install-command">
+        <code id="installCmd">curl -fsSL https://openbox.crushcodeworks.com/install.sh | bash</code>
+        <button class="copy-btn" onclick="copyInstall()">
+          <i class="fas fa-copy"></i>
+          Copy
+        </button>
+      </div>
+      <div class="install-features">
+        <div class="install-feature">
+          <i class="fas fa-check-circle"></i>
+          Works on Ubuntu, Debian, Fedora, Rocky, Arch
+        </div>
+        <div class="install-feature">
+          <i class="fas fa-check-circle"></i>
+          Supports UGREEN NAS, VPS, WSL2, Raspberry Pi
+        </div>
+        <div class="install-feature">
+          <i class="fas fa-check-circle"></i>
+          Auto-configures Docker, firewall, SSL
+        </div>
+        <div class="install-feature">
+          <i class="fas fa-check-circle"></i>
+          SHA256 + ed25519 verified releases
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Testimonials -->
+<section id="testimonials">
+  <div class="container">
+    <div class="section-header reveal">
+      <span class="section-label">From the Community</span>
+      <h2>Real people. Real self-hosting.</h2>
+      <p>Built by the community, for the community. Every feature traces back to a real user report.</p>
+    </div>
+    <div class="testimonials-grid">
+      <div class="testimonial-card reveal">
+        <div class="testimonial-quote">"</div>
+        <p class="testimonial-text">That was one of the nicest installs I've done in a long time, super fast too and this interface is gorgeous. I love it!</p>
+        <div class="testimonial-author">
+          <div class="testimonial-avatar">BB</div>
+          <div>
+            <div class="testimonial-name">BadBunny</div>
+            <div class="testimonial-handle">YouTube Commenter</div>
+          </div>
+        </div>
+      </div>
+      <div class="testimonial-card reveal reveal-delay-1">
+        <div class="testimonial-quote">"</div>
+        <p class="testimonial-text">Just setup something similar and took me weeks! This is amazing — saved me so much time and frustration.</p>
+        <div class="testimonial-author">
+          <div class="testimonial-avatar">DS</div>
+          <div>
+            <div class="testimonial-name">DarkStorm909</div>
+            <div class="testimonial-handle">YouTube Commenter</div>
+          </div>
+        </div>
+      </div>
+      <div class="testimonial-card reveal reveal-delay-2">
+        <div class="testimonial-quote">"</div>
+        <p class="testimonial-text">Incredible work. This is next level brilliance — the attention to detail in the automation and UX is unreal.</p>
+        <div class="testimonial-author">
+          <div class="testimonial-avatar">AS</div>
+          <div>
+            <div class="testimonial-name">astrodude45</div>
+            <div class="testimonial-handle">YouTube Commenter</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- Footer -->
+<footer>
+  <div class="container">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <a href="#" class="nav-logo" style="font-size: 18px;">
+          <div class="nav-logo-icon" style="width:28px;height:28px;font-size:14px;">⬡</div>
+          OpenBox
+        </a>
+        <p>Your private cloud. One command. Free for personal use. Built by the community, for the community.</p>
+      </div>
+      <div class="footer-col">
+        <h4>Product</h4>
+        <a href="#features">Features</a>
+        <a href="#modules">Modules</a>
+        <a href="#install">Install</a>
+        <a href="docs.html">Documentation</a>
+        <a href="changelog.html">Changelog</a>
+      </div>
+      <div class="footer-col">
+        <h4>Community</h4>
+        <a href="https://github.com/crushcodeworks/openbox" target="_blank">GitHub</a>
+        <a href="#">Discord</a>
+        <a href="#">YouTube</a>
+      </div>
+      <div class="footer-col">
+        <h4>Legal</h4>
+        <a href="#">Privacy</a>
+        <a href="#">Terms</a>
+        <a href="#">Security</a>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <p>© 2025 OpenBox. Open source. Free for personal use.</p>
+      <div class="footer-social">
+        <a href="#"><i class="fab fa-github"></i></a>
+        <a href="#"><i class="fab fa-discord"></i></a>
+        <a href="#"><i class="fab fa-youtube"></i></a>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+// ===== Particle System =====
+const canvas = document.getElementById('particles');
+const ctx = canvas.getContext('2d');
+let particles = [];
+
+function resizeCanvas() {
+  canvas.width = window.innerWidth;
+  canvas.height = window.innerHeight;
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+class Particle {
+  constructor() {
+    this.reset();
+  }
+  reset() {
+    this.x = Math.random() * canvas.width;
+    this.y = Math.random() * canvas.height;
+    this.size = Math.random() * 2 + 0.5;
+    this.speedX = (Math.random() - 0.5) * 0.5;
+    this.speedY = (Math.random() - 0.5) * 0.3;
+    this.opacity = Math.random() * 0.5 + 0.1;
+    this.color = Math.random() > 0.7 ? '#7c5cff' : '#22d3ee';
+  }
+  update() {
+    this.x += this.speedX;
+    this.y += this.speedY;
+    if (this.x < 0 || this.x > canvas.width || this.y < 0 || this.y > canvas.height) {
+      this.reset();
+    }
+  }
+  draw() {
+    ctx.beginPath();
+    ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+    ctx.fillStyle = this.color;
+    ctx.globalAlpha = this.opacity;
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+}
+
+const particleCount = Math.min(80, Math.floor(window.innerWidth / 15));
+for (let i = 0; i < particleCount; i++) {
+  particles.push(new Particle());
+}
+
+function animateParticles() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  particles.forEach(p => { p.update(); p.draw(); });
+
+  // Draw connecting lines
+  for (let i = 0; i < particles.length; i++) {
+    for (let j = i + 1; j < particles.length; j++) {
+      const dx = particles[i].x - particles[j].x;
+      const dy = particles[i].y - particles[j].y;
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (dist < 150) {
+        ctx.beginPath();
+        ctx.moveTo(particles[i].x, particles[i].y);
+        ctx.lineTo(particles[j].x, particles[j].y);
+        ctx.strokeStyle = 'rgba(124, 92, 255, 0.1)';
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+      }
+    }
+  }
+  requestAnimationFrame(animateParticles);
+}
+animateParticles();
+
+// ===== Scroll Reveal =====
+const observer = new IntersectionObserver((entries) => {
+  entries.forEach(entry => {
+    if (entry.isIntersecting) {
+      entry.target.classList.add('visible');
+    }
+  });
+}, { threshold: 0.1, rootMargin: '0px 0px -50px 0px' });
+
+document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+// ===== Nav scroll effect =====
+window.addEventListener('scroll', () => {
+  const nav = document.getElementById('navbar');
+  if (window.scrollY > 50) {
+    nav.classList.add('scrolled');
+  } else {
+    nav.classList.remove('scrolled');
+  }
+});
+
+// ===== Mobile menu =====
+function toggleMobile() {
+  document.getElementById('mobileMenu').classList.toggle('open');
+}
+
+// ===== Copy install command =====
+function copyInstall() {
+  const cmd = document.getElementById('installCmd').textContent;
+  navigator.clipboard.writeText(cmd).then(() => {
+    const btn = document.querySelector('.copy-btn');
+    btn.innerHTML = '<i class="fas fa-check"></i> Copied!';
+    setTimeout(() => {
+      btn.innerHTML = '<i class="fas fa-copy"></i> Copy';
+    }, 2000);
+  });
+}
+
+// ===== Counter animation =====
+function animateCounters() {
+  document.querySelectorAll('.stat-num[data-count]').forEach(el => {
+    const target = parseInt(el.dataset.count);
+    if (target === 0) return; // Skip non-numeric like "1.1MB"
+    const duration = 2000;
+    const step = target / (duration / 16);
+    let current = 0;
+    const timer = setInterval(() => {
+      current += step;
+      if (current >= target) {
+        current = target;
+        clearInterval(timer);
+      }
+      el.textContent = Math.floor(current);
+    }, 16);
+  });
+}
+
+// Trigger counter animation when hero stats are visible
+const heroStatsObserver = new IntersectionObserver((entries) => {
+  if (entries[0].isIntersecting) {
+    setTimeout(animateCounters, 800);
+    heroStatsObserver.disconnect();
+  }
+}, { threshold: 0.5 });
+
+document.querySelectorAll('.hero-stats').forEach(el => heroStatsObserver.observe(el));
+
+// ===== Smooth scroll for anchor links =====
+document.querySelectorAll('a[href^="#"]').forEach(anchor => {
+  anchor.addEventListener('click', function(e) {
+    e.preventDefault();
+    const target = document.querySelector(this.getAttribute('href'));
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }
+  });
+});
+</script>
+</body>
+</html>

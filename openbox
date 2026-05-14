@@ -1,0 +1,4285 @@
+#!/usr/bin/env bash
+# ==========================================
+# OpenBox CLI
+# Modular self-hosted privacy stack manager
+# Supports both VPS and NAS environments
+# Created by Crush Code Works | youtube.com/@CrushCodeWorks
+# ==========================================
+
+set -euo pipefail
+
+# --- Config ---
+# Resolution order: .env file OB_ROOT -> env var -> default
+resolve_ob_root() {
+    # 1. Check for .env in common locations to find OB_ROOT
+    local candidates=(
+        "${OB_ROOT:-}"
+        "/opt/openbox"
+    )
+
+    # Also check install-meta.conf in script's own directory.
+    # readlink -f follows the /usr/local/bin/openbox symlink all the
+    # way to the real install path — without it, invoking the CLI via
+    # the symlink resolves script_dir to /usr/local/bin, which has no
+    # modules/ subdir, and every OB_ROOT-relative command falls back
+    # to the /opt/openbox default and fails on NAS installs.
+    local script_dir real_script
+    real_script="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
+    script_dir="$(cd "$(dirname "${real_script}")" && pwd)"
+    if [[ -f "${script_dir}/state/install-meta.conf" ]]; then
+        local meta_dir
+        meta_dir=$(grep '^INSTALL_DIR=' "${script_dir}/state/install-meta.conf" 2>/dev/null | cut -d= -f2)
+        [[ -n "${meta_dir}" ]] && candidates=("${meta_dir}" "${candidates[@]}")
+    fi
+
+    # The script's own directory is the most reliable indicator
+    candidates=("${script_dir}" "${candidates[@]}")
+
+    for dir in "${candidates[@]}"; do
+        [[ -z "${dir}" ]] && continue
+        # The script's own directory is always trusted first if it has modules/
+        if [[ -d "${dir}/modules" ]]; then
+            echo "${dir}"
+            return
+        fi
+        if [[ -f "${dir}/.env" ]]; then
+            # Pick the LAST OB_ROOT= line that points to an existing directory
+            # with a modules/ subdirectory. Multiple lines can exist from
+            # re-runs of the installer.
+            local env_root=""
+            while IFS= read -r line; do
+                local candidate
+                candidate=$(echo "${line}" | cut -d= -f2-)
+                if [[ -n "${candidate}" && -d "${candidate}/modules" ]]; then
+                    env_root="${candidate}"
+                fi
+            done < <(grep '^OB_ROOT=' "${dir}/.env" 2>/dev/null)
+
+            if [[ -n "${env_root}" ]]; then
+                echo "${env_root}"
+                return
+            fi
+            # .env exists but no valid OB_ROOT -- use the dir itself
+            echo "${dir}"
+            return
+        fi
+    done
+
+    # Fallback
+    echo "${OB_ROOT:-/opt/openbox}"
+}
+
+OB_ROOT="$(resolve_ob_root)"
+OB_STATE_DIR="${OB_ROOT}/state"
+OB_MODULES_DIR="${OB_ROOT}/modules"
+OB_MODULES_CONF="${OB_STATE_DIR}/modules.conf"
+OB_ENV_FILE="${OB_ROOT}/.env"
+OB_BACKUP_DIR="${OB_ROOT}/backups"
+# Reads VERSION file at install root so the CLI banner always shows
+# the running version. Falls back to "unknown" if the file is missing.
+OB_VERSION="$(cat "${OB_ROOT}/VERSION" 2>/dev/null | tr -d '[:space:]' || echo "unknown")"
+if [[ -z "${OB_VERSION}" ]]; then OB_VERSION="unknown"; fi
+
+# OB_HOST_ROOT — the install path as seen from the Docker daemon's
+# host filesystem. When this CLI runs INSIDE the dashboard container
+# OB_ROOT resolves to /app (bind-mounted), but Docker daemon bind-mount
+# paths are resolved against the real host filesystem, where /app
+# doesn't exist. The real host path lives in the .env file and must
+# be used whenever we shell out to `docker compose`, otherwise compose
+# substitutes ${OB_ROOT} with /app and Docker auto-creates empty
+# root-owned dirs that break every module with a data bind mount
+# (Grafana, Prometheus, Immich, Nextcloud — all of them).
+#
+# Outside the container, OB_HOST_ROOT == OB_ROOT. No behavior change.
+OB_HOST_ROOT="${OB_ROOT}"
+if [[ -f "${OB_ENV_FILE}" ]]; then
+    _env_host_root=$(grep '^OB_ROOT=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)
+    if [[ -n "${_env_host_root}" && "${_env_host_root}" != "${OB_ROOT}" ]]; then
+        OB_HOST_ROOT="${_env_host_root}"
+    fi
+    unset _env_host_root
+fi
+
+# Defense-in-depth: validate OB_ROOT and OB_HOST_ROOT against a strict
+# path character set. Codex command-injection audit (2026-05-01)
+# caught 6 sites where these vars get interpolated into `bash -c` /
+# `sh -c` strings without quoting. Realistic attack vector is small
+# (only install.sh --install-dir or hand-edited .env can set OB_ROOT
+# to a malicious value, and that already requires sudo on the box),
+# but a strict allowlist on the path itself makes ALL of those sites
+# safe by construction.
+#
+# Allowed: /, alphanumeric, _, -, .
+# Blocked: shell metacharacters ($, `, (, ), ;, |, &, *, ?, [, ], {, }, \, ", ', spaces, newlines)
+_validate_path() {
+    local val="$1" name="$2"
+    if [[ -z "${val}" ]]; then return 0; fi
+    if [[ ! "${val}" =~ ^/[a-zA-Z0-9_./-]+$ ]]; then
+        echo "ERROR: ${name} contains disallowed characters: '${val}'" >&2
+        echo "       OpenBox install paths must match /[a-zA-Z0-9_./-]+ — no spaces, no shell metacharacters." >&2
+        echo "       If your install dir really has unusual characters, edit /opt/openbox/.env to fix OB_ROOT." >&2
+        exit 1
+    fi
+}
+_validate_path "${OB_ROOT}" "OB_ROOT"
+_validate_path "${OB_HOST_ROOT}" "OB_HOST_ROOT"
+unset -f _validate_path
+
+# Detect environment
+IS_NAS=false
+NAS_TYPE=""
+OB_PROFILE=""
+OB_PROFILE_REASONS=""
+if [[ -f "${OB_STATE_DIR}/install-meta.conf" ]]; then
+    IS_NAS=$(grep '^IS_NAS=' "${OB_STATE_DIR}/install-meta.conf" 2>/dev/null | cut -d= -f2 || echo "false")
+    NAS_TYPE=$(grep '^NAS_TYPE=' "${OB_STATE_DIR}/install-meta.conf" 2>/dev/null | cut -d= -f2 || echo "")
+    OB_PROFILE=$(grep '^OB_PROFILE=' "${OB_STATE_DIR}/install-meta.conf" 2>/dev/null | cut -d= -f2- || echo "")
+    OB_PROFILE_REASONS=$(grep '^OB_PROFILE_REASONS=' "${OB_STATE_DIR}/install-meta.conf" 2>/dev/null | cut -d= -f2- || echo "")
+fi
+# Pre-1.6.58 installs won't have OB_PROFILE in install-meta.conf. Derive
+# a best-guess from IS_NAS so banner / dashboard / future hardening checks
+# don't see an empty value. The next install/upgrade will write the real
+# classification.
+if [[ -z "${OB_PROFILE}" ]]; then
+    if [[ "${IS_NAS}" == "true" ]]; then
+        OB_PROFILE="nas"
+    else
+        OB_PROFILE="unknown"
+    fi
+fi
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# --- Helpers ---
+
+log_info() { echo -e "${BLUE}[INFO]${NC} $*"; }
+log_ok() { echo -e "${GREEN}[OK]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $*"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+
+banner() {
+    echo -e "${CYAN}"
+    echo "  ____                   _    ____            "
+    echo " / ___| _ __   __ _ _ __| | _| __ )  _____  __"
+    echo " \\___ \\| '_ \\ / _\` | '__| |/ /  _ \\ / _ \\ \\/ /"
+    echo "  ___) | |_) | (_| | |  |   <| |_) | (_) >  < "
+    echo " |____/| .__/ \\__,_|_|  |_|\\_\\____/ \\___/_/\\_\\"
+    echo "       |_|                                     "
+    echo -e "${NC}"
+    echo -e " ${BOLD}OpenBox${NC} v${OB_VERSION} - Self-Hosted Privacy Stack"
+    echo -e " Created by Crush Code Works | youtube.com/@CrushCodeWorks"
+    if [[ "${IS_NAS}" == "true" ]]; then
+        echo -e " Environment: NAS (${NAS_TYPE:-detected})"
+    elif [[ -n "${OB_PROFILE}" && "${OB_PROFILE}" != "unknown" ]]; then
+        echo -e " Network profile: ${OB_PROFILE}"
+    fi
+    echo ""
+}
+
+ensure_state_dir() {
+    mkdir -p "${OB_STATE_DIR}"
+    if [[ ! -f "${OB_MODULES_CONF}" ]]; then
+        # Default: only core and dashboard modules (media is optional)
+        echo "core" > "${OB_MODULES_CONF}"
+        echo "dashboard" >> "${OB_MODULES_CONF}"
+    fi
+}
+
+get_enabled_modules() {
+    ensure_state_dir
+    cat "${OB_MODULES_CONF}" 2>/dev/null | sort -u
+}
+
+# v1.6.35 split: the legacy `privacy` umbrella module bundled Pi-hole +
+# Vaultwarden + Authelia, three completely independent services. They
+# share no functional dependency, just a marketing label, so bundling
+# them meant a user who wanted ad-blocking still had to configure
+# Vaultwarden + Authelia secrets and run all three containers. It also
+# meant any one of the three failing took the whole module enable down
+# (cf. v1.6.34 prefetch fix). Splitting into three modules lets users
+# pick what they want and isolates failures.
+#
+# This helper migrates an existing legacy install in two parts:
+#   1. modules.conf: replace `privacy` line with the three new names.
+#   2. modules/privacy/config/{pihole,vaultwarden,authelia}/ → move
+#      to modules/{pihole,vaultwarden,authelia}/config/ so Pi-hole
+#      keeps its blocklist DB, Vaultwarden keeps its vault, and
+#      Authelia keeps its rendered config + users database.
+#
+# Idempotent: a system that's already migrated (no `privacy` in
+# modules.conf, no modules/privacy/config dir) emits nothing and costs
+# ~1ms. Runs before image prefetch and compose so by the time anything
+# touches `privacy`-named state, it's already moved.
+migrate_privacy_split() {
+    local needs_conf_rewrite=0
+    local needs_data_move=0
+    if [[ -f "${OB_MODULES_CONF}" ]] && grep -qx 'privacy' "${OB_MODULES_CONF}" 2>/dev/null; then
+        needs_conf_rewrite=1
+    fi
+    local legacy_dir="${OB_ROOT}/modules/privacy/config"
+    if [[ -d "${legacy_dir}" ]] && \
+       ([[ -d "${legacy_dir}/pihole" ]] || \
+        [[ -d "${legacy_dir}/vaultwarden" ]] || \
+        [[ -d "${legacy_dir}/authelia" ]]); then
+        needs_data_move=1
+    fi
+    if [[ ${needs_conf_rewrite} -eq 0 && ${needs_data_move} -eq 0 ]]; then
+        return 0
+    fi
+
+    log_info "Migrating legacy 'privacy' module → pihole + vaultwarden + authelia (one-time)"
+
+    # Stop legacy containers BEFORE moving config — Vaultwarden in
+    # particular keeps its sqlite DB hot-mapped, and moving while it's
+    # writing risks a half-flushed transaction. They'll be re-created
+    # on the new mount paths by the upcoming compose up.
+    for svc in ob-pihole ob-vaultwarden ob-authelia; do
+        if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "${svc}"; then
+            log_info "  stopping ${svc} for safe data move"
+            docker stop "${svc}" >/dev/null 2>&1 || true
+        fi
+    done
+
+    if [[ ${needs_data_move} -eq 1 ]]; then
+        for sub in pihole vaultwarden authelia; do
+            local src="${legacy_dir}/${sub}"
+            local dst="${OB_ROOT}/modules/${sub}/config"
+            if [[ -d "${src}" ]]; then
+                if [[ -e "${dst}" ]]; then
+                    # If the destination already has content (partial
+                    # migration on a previous failed run, or someone
+                    # manually pre-seeded), don't overwrite — log and
+                    # skip so an operator can resolve. Empty dst dir is
+                    # fine, mv will replace it cleanly.
+                    if [[ -n "$(ls -A "${dst}" 2>/dev/null)" ]]; then
+                        log_warn "  ${dst} already populated — leaving ${src} in place; please resolve manually"
+                        continue
+                    fi
+                    rmdir "${dst}" 2>/dev/null || true
+                fi
+                mkdir -p "$(dirname "${dst}")"
+                mv "${src}" "${dst}"
+                log_info "  moved ${src} → ${dst}"
+            fi
+        done
+        # Best-effort cleanup of the empty legacy dir tree.
+        rmdir "${legacy_dir}" 2>/dev/null || true
+        rmdir "${OB_ROOT}/modules/privacy" 2>/dev/null || true
+    fi
+
+    if [[ ${needs_conf_rewrite} -eq 1 ]]; then
+        # Rewrite modules.conf atomically: keep all non-`privacy` lines,
+        # then append the three new module names. We don't dedupe because
+        # ensure_state_dir's read uses `sort -u`, but this also avoids
+        # writing duplicate entries on the disk file itself.
+        local tmp
+        tmp=$(mktemp "${OB_MODULES_CONF}.migrate.XXXXXX") || {
+            log_error "Could not create tempfile next to ${OB_MODULES_CONF} — skipping conf rewrite"
+            return 1
+        }
+        grep -vx 'privacy' "${OB_MODULES_CONF}" 2>/dev/null > "${tmp}" || true
+        for new in pihole vaultwarden authelia; do
+            grep -qx "${new}" "${tmp}" 2>/dev/null || echo "${new}" >> "${tmp}"
+        done
+        mv "${tmp}" "${OB_MODULES_CONF}"
+        log_info "  modules.conf: privacy → pihole + vaultwarden + authelia"
+    fi
+
+    log_ok "Privacy module migration complete."
+}
+
+is_module_enabled() {
+    local module="$1"
+    grep -qx "${module}" "${OB_MODULES_CONF}" 2>/dev/null
+}
+
+# --- Dynamic module discovery ---
+
+discover_modules() {
+    for dir in "${OB_MODULES_DIR}"/*/; do
+        local name
+        name=$(basename "${dir}")
+        if [[ -f "${dir}docker-compose.yml" ]]; then
+            echo "${name}"
+        fi
+    done
+}
+
+read_openbox_field() {
+    local module="$1"
+    local field="$2"
+    local compose="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+    [[ -f "${compose}" ]] || return
+
+    sed -n '/^x-openbox:/,/^[a-z]/p' "${compose}" | \
+        grep -E "^  ${field}:" | head -1 | \
+        sed "s/^  ${field}:[[:space:]]*//" | \
+        sed 's/^"\(.*\)"$/\1/' | sed "s/^'\(.*\)'$/\1/"
+}
+
+get_core_modules() {
+    for mod in $(discover_modules); do
+        local required
+        required=$(read_openbox_field "${mod}" "required")
+        if [[ "${required}" == "true" ]]; then
+            echo "${mod}"
+        fi
+    done
+}
+
+get_optional_modules() {
+    for mod in $(discover_modules); do
+        local required
+        required=$(read_openbox_field "${mod}" "required")
+        if [[ "${required}" != "true" ]]; then
+            echo "${mod}"
+        fi
+    done
+}
+
+is_core_module() {
+    local module="$1"
+    local required
+    required=$(read_openbox_field "${module}" "required")
+    [[ "${required}" == "true" ]]
+}
+
+is_valid_module() {
+    local module="$1"
+    [[ -f "${OB_MODULES_DIR}/${module}/docker-compose.yml" ]]
+}
+
+get_compose_args() {
+    local args=""
+    local project_name="openbox"
+
+    # Check if hardware transcoding should be enabled
+    local hw_accel=""
+    if [[ -f "${OB_ENV_FILE}" ]]; then
+        hw_accel=$(grep '^JELLYFIN_HW_ACCEL=' "${OB_ENV_FILE}" 2>/dev/null | cut -d= -f2 || echo "")
+    fi
+
+    for module in $(get_enabled_modules); do
+        local compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+        if [[ -f "${compose_file}" ]]; then
+            args="${args} -f ${compose_file}"
+        else
+            log_warn "Compose file not found for module: ${module}"
+        fi
+
+        # Include hardware transcoding override for jellyfin/media modules
+        # when JELLYFIN_HW_ACCEL is set to intel/auto/true AND /dev/dri exists on the host
+        if [[ "${hw_accel}" != "" && "${hw_accel}" != "none" && -d /dev/dri ]]; then
+            local hw_file="${OB_MODULES_DIR}/${module}/docker-compose.hw.yml"
+            if [[ -f "${hw_file}" ]]; then
+                args="${args} -f ${hw_file}"
+            fi
+        fi
+    done
+
+    echo "-p ${project_name} ${args}"
+}
+
+load_env() {
+    if [[ -f "${OB_ENV_FILE}" ]]; then
+        while IFS= read -r line; do
+            [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+            export "$line"
+        done < "${OB_ENV_FILE}"
+    fi
+}
+
+backup_filename_matches() {
+    local filename
+    filename="$(basename "$1")"
+    [[ "${filename}" =~ ^openbox-(full|config|backup)-([0-9]{8}_[0-9]{6}|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}-[0-9]{2}-[0-9]{2})\.tar\.gz(\.enc)?$ ]]
+}
+
+backup_timestamp() {
+    date +%Y%m%d_%H%M%S
+}
+
+resolve_backup_mount_source() {
+    local raw="$1"
+    local compose_dir="$2"
+    local source="${raw}"
+
+    source="${source%\"}"
+    source="${source#\"}"
+    source="${source%\'}"
+    source="${source#\'}"
+    source="${source//\$\{OB_ROOT:-/opt/openbox\}/${OB_HOST_ROOT}}"
+    source="${source//\$\{OB_ROOT\}/${OB_HOST_ROOT}}"
+    source="${source//\$OB_ROOT/${OB_HOST_ROOT}}"
+
+    local abs=""
+    if [[ "${source}" == /* ]]; then
+        abs="$(readlink -m "${source}")"
+    elif [[ "${source}" == "." || "${source}" == ".." || "${source}" == ./* || "${source}" == ../* ]]; then
+        abs="$(readlink -m "${compose_dir}/${source}")"
+    else
+        return 0
+    fi
+
+    if [[ "${abs}" == /var/run/* || "${abs}" == /etc/* || "${abs}" == /dev/* ]]; then
+        return 0
+    fi
+    if [[ "${abs}" != "${OB_HOST_ROOT}" && "${abs}" != "${OB_HOST_ROOT}/"* ]]; then
+        return 0
+    fi
+
+    local rel="${abs#${OB_HOST_ROOT}/}"
+    if [[ "${abs}" == "${OB_HOST_ROOT}" ]]; then
+        rel="."
+    fi
+    printf '%s\n' "${rel}"
+}
+
+backup_path_allowed() {
+    local rel="$1"
+    [[ -z "${rel}" || "${rel}" == "." ]] && return 1
+    [[ "${rel}" == "modules" || "${rel}" == "backups" || "${rel}" == "dashboard" || "${rel}" == "openbox" || "${rel}" == "VERSION" ]] && return 1
+    return 0
+}
+
+backup_path_allowed_config_only() {
+    local rel="$1"
+    [[ "${rel}" == ".env" || "${rel}" == "state" ]] && return 0
+    [[ "${rel}" =~ ^modules/[^/]+/config(/.*)?$ ]] && return 0
+    return 1
+}
+
+collect_backup_paths() {
+    local mode="${1:-full}"
+    local -a discovered=(".env" "state")
+    if [[ "${mode}" != "config-only" ]]; then
+        discovered+=("data")
+    fi
+
+    local module compose_file compose_dir line in_volumes=0 volumes_indent=0 current_mode="" current_indent=0 current_type="" current_source=""
+    _ob_split_volume_source() {
+        # Emit the portion of a docker-compose short-form volume string
+        # that precedes the first top-level colon, respecting ${...}
+        # brace groups. Used by the volume parser above. Codex round 3
+        # finding #3.
+        local s="$1" depth=0 i ch next
+        for ((i = 0; i < ${#s}; i++)); do
+            ch="${s:i:1}"
+            next="${s:i+1:1}"
+            if [[ "$ch" == "$" && "$next" == "{" ]]; then
+                depth=$((depth + 1))
+                i=$((i + 1))
+                continue
+            fi
+            if [[ "$ch" == "{" ]]; then depth=$((depth + 1)); continue; fi
+            if [[ "$ch" == "}" ]]; then depth=$((depth - 1)); (( depth < 0 )) && depth=0; continue; fi
+            if [[ "$ch" == ":" && $depth -eq 0 ]]; then
+                printf '%s' "${s:0:i}"
+                return
+            fi
+        done
+        printf '%s' "$s"
+    }
+    flush_volume_item() {
+        local resolved=""
+        if [[ "${current_mode}" == "string" && -n "${current_source}" ]]; then
+            resolved="$(resolve_backup_mount_source "${current_source}" "${compose_dir}")"
+        elif [[ "${current_mode}" == "object" && ( -z "${current_type}" || "${current_type}" == "bind" ) && -n "${current_source}" ]]; then
+            resolved="$(resolve_backup_mount_source "${current_source}" "${compose_dir}")"
+        fi
+        if backup_path_allowed "${resolved}"; then
+            if [[ "${mode}" == "config-only" ]]; then
+                if backup_path_allowed_config_only "${resolved}"; then
+                    discovered+=("${resolved}")
+                fi
+            else
+                discovered+=("${resolved}")
+            fi
+        fi
+        current_mode=""
+        current_indent=0
+        current_type=""
+        current_source=""
+    }
+
+    while IFS= read -r module; do
+        [[ -z "${module}" ]] && continue
+        compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+        compose_dir="$(dirname "${compose_file}")"
+        [[ -f "${compose_file}" ]] || continue
+        in_volumes=0
+        volumes_indent=0
+        current_mode=""
+        current_indent=0
+        current_type=""
+        current_source=""
+
+        while IFS= read -r line || [[ -n "${line}" ]]; do
+            local trimmed indent
+            trimmed="${line#"${line%%[![:space:]]*}"}"
+            indent=$(( ${#line} - ${#trimmed} ))
+
+            if [[ ${in_volumes} -eq 0 ]]; then
+                if [[ "${trimmed}" == "volumes:" ]]; then
+                    in_volumes=1
+                    volumes_indent=${indent}
+                fi
+                continue
+            fi
+
+            [[ -z "${trimmed}" || "${trimmed}" == \#* ]] && continue
+
+            if [[ ${indent} -le ${volumes_indent} ]]; then
+                flush_volume_item
+                in_volumes=0
+                if [[ "${trimmed}" == "volumes:" ]]; then
+                    in_volumes=1
+                    volumes_indent=${indent}
+                fi
+                continue
+            fi
+
+            if [[ "${trimmed}" == -* ]]; then
+                flush_volume_item
+                local rest="${trimmed#- }"
+                current_indent=${indent}
+                current_mode="string"
+                current_type=""
+                current_source=""
+                if [[ "${rest}" =~ ^(type|source|target):[[:space:]]*(.+)$ ]]; then
+                    current_mode="object"
+                    case "${BASH_REMATCH[1]}" in
+                        type) current_type="${BASH_REMATCH[2]}" ;;
+                        source) current_source="${BASH_REMATCH[2]}" ;;
+                    esac
+                else
+                    # Codex round 3 finding #3: bash's ${rest%%:*} strips
+                    # everything from the FIRST colon, including colons
+                    # inside ${VAR:-default}. A volume like
+                    # ${OB_ROOT:-/opt/openbox}/data:/app got truncated to
+                    # "${OB_ROOT" and module bind mounts went missing
+                    # from backups. Split at the first top-level colon
+                    # instead by tracking brace depth.
+                    current_source="$(_ob_split_volume_source "${rest}")"
+                fi
+                continue
+            fi
+
+            if [[ "${current_mode}" == "object" && ${indent} -gt ${current_indent} ]]; then
+                if [[ "${trimmed}" =~ ^(type|source|target):[[:space:]]*(.+)$ ]]; then
+                    case "${BASH_REMATCH[1]}" in
+                        type) current_type="${BASH_REMATCH[2]}" ;;
+                        source) current_source="${BASH_REMATCH[2]}" ;;
+                    esac
+                fi
+            fi
+        done < "${compose_file}"
+        flush_volume_item
+    done < <(get_enabled_modules)
+
+    local -A seen=()
+    local rel
+    for rel in "${discovered[@]}"; do
+        [[ -z "${rel}" ]] && continue
+        if [[ "${mode}" == "config-only" && "${rel}" != ".env" && "${rel}" != "state" ]]; then
+            backup_path_allowed_config_only "${rel}" || continue
+        fi
+        if [[ "${rel}" == ".env" ]]; then
+            [[ -e "${OB_ROOT}/.env" ]] || continue
+        else
+            [[ -e "${OB_ROOT}/${rel}" ]] || continue
+        fi
+        if [[ -z "${seen[${rel}]:-}" ]]; then
+            seen["${rel}"]=1
+            printf '%s\n' "${rel}"
+        fi
+    done
+}
+
+restore_recover_interrupted_swap() {
+    if [[ -e "${OB_ROOT}" ]]; then
+        return 0
+    fi
+    local parent_dir base_name rollback_dir
+    parent_dir="$(dirname "${OB_ROOT}")"
+    base_name="$(basename "${OB_ROOT}")"
+    rollback_dir="$(find "${parent_dir}" -maxdepth 1 -mindepth 1 -type d -name "${base_name}.restore-rollback-*" | sort | tail -n 1 || true)"
+    [[ -z "${rollback_dir}" ]] && return 0
+    mv "${rollback_dir}" "${OB_ROOT}"
+    find "${parent_dir}" -maxdepth 1 -mindepth 1 -type d -name "${base_name}.restore-staging-*" -exec rm -rf {} + 2>/dev/null || true
+}
+
+restore_snapshot_paths() {
+    local snapshot_dir="$1"
+    mkdir -p "${snapshot_dir}"
+    local rel
+    for rel in ".env" "state" "backups" "data"; do
+        [[ -e "${OB_ROOT}/${rel}" ]] || continue
+        mkdir -p "${snapshot_dir}/$(dirname "${rel}")"
+        cp -a "${OB_ROOT}/${rel}" "${snapshot_dir}/${rel}"
+    done
+    for rel in "${OB_ROOT}"/modules/*/config "${OB_ROOT}"/modules/*/data; do
+        [[ -e "${rel}" ]] || continue
+        mkdir -p "${snapshot_dir}/$(dirname "${rel#${OB_ROOT}/}")"
+        cp -a "${rel}" "${snapshot_dir}/${rel#${OB_ROOT}/}"
+    done
+}
+
+restore_stage_and_swap() {
+    local restore_file="$1"
+    local rollback_dir="$2"
+    local staging_dir="$3"
+
+    rm -rf "${staging_dir}"
+    cp -a "${OB_ROOT}" "${staging_dir}"
+    tar -xzf "${restore_file}" -C "${staging_dir}" --no-same-owner --no-same-permissions
+    mv "${OB_ROOT}" "${rollback_dir}"
+    if ! mv "${staging_dir}" "${OB_ROOT}"; then
+        mv "${rollback_dir}" "${OB_ROOT}"
+        rm -rf "${staging_dir}"
+        return 1
+    fi
+}
+
+restore_rollback_swap() {
+    local rollback_dir="$1"
+    [[ -e "${rollback_dir}" ]] || return 0
+    rm -rf "${OB_ROOT}"
+    mv "${rollback_dir}" "${OB_ROOT}"
+}
+
+restore_start_stack() {
+    if ! docker network inspect ob_proxy &>/dev/null; then
+        docker network create --subnet=172.20.0.0/24 ob_proxy >/dev/null
+    fi
+    run_compose_per_module up -d
+}
+
+run_compose() {
+    local compose_args
+    compose_args=$(get_compose_args)
+
+    # OB_ROOT is overridden here so docker compose substitutes bind-mount
+    # paths against the REAL host filesystem, not the in-container view.
+    # See the OB_HOST_ROOT comment at the top of this script.
+    if [[ -f "${OB_ENV_FILE}" ]]; then
+        # shellcheck disable=SC2086
+        OB_ROOT="${OB_HOST_ROOT}" docker compose --env-file "${OB_ENV_FILE}" ${compose_args} "$@"
+    else
+        # shellcheck disable=SC2086
+        OB_ROOT="${OB_HOST_ROOT}" docker compose ${compose_args} "$@"
+    fi
+}
+
+# Run a compose subcommand for EACH enabled module individually.
+# Unlike run_compose (which passes all -f files in one invocation), this
+# avoids docker compose's cross-file top-level merge of `x-openbox.*`
+# keys, which fails with "cannot override x-openbox.tips" when modules
+# define that key with different shapes. Per-module invocation also means
+# one broken module doesn't block the others.
+run_compose_per_module() {
+    local subcmd="$1"; shift
+    local rc=0
+    # Every per-module compose call runs under project "openbox" with a
+    # single -f file, so docker compose sees every OTHER module's
+    # containers as orphans and logs a "Found orphan containers: ..." warning
+    # on every invocation. That noise makes real errors impossible to spot
+    # during install and triage. COMPOSE_IGNORE_ORPHANS=True is the
+    # documented way to silence that specific warning without changing
+    # any behavior — we still clean up real orphans explicitly on `down`.
+    for module in $(get_enabled_modules); do
+        # Skip the dashboard module on `up` because this script is often
+        # invoked FROM inside the dashboard container — recreating it
+        # would kill the process running us. The dashboard is already
+        # running (we wouldn't be here otherwise), so it's a no-op.
+        # For `down` and other commands, we include it normally.
+        if [[ "${subcmd}" == "up" && "${module}" == "dashboard" ]]; then
+            # Only skip if the container is actually already running
+            if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ob-dashboard$'; then
+                continue
+            fi
+        fi
+        local compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+        if [[ ! -f "${compose_file}" ]]; then
+            log_warn "Compose file not found for module: ${module}"
+            continue
+        fi
+        if [[ -f "${OB_ENV_FILE}" ]]; then
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" "${subcmd}" "$@" || rc=$?
+        else
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose -p openbox -f "${compose_file}" "${subcmd}" "$@" || rc=$?
+        fi
+    done
+    return $rc
+}
+
+# Pull any images referenced by enabled modules' compose files that
+# aren't already present locally, with retry. Idempotent: a module
+# whose images are all cached emits nothing and costs ~5ms.
+#
+# Why a separate pass instead of letting `compose up` pull implicitly:
+# see the call site comment in cmd_up. Short version: explicit pull
+# gives us retry, visible progress in the dashboard install log, and
+# a clear "image pull failed" error message instead of a generic
+# compose exit 1. First-module-enable on a slow NAS connection used
+# to crash the whole install when one of N images timed out.
+prefetch_missing_module_images() {
+    local only_module="${1:-}"
+    local modules_to_check
+    if [[ -n "${only_module}" ]]; then
+        modules_to_check="${only_module}"
+    else
+        modules_to_check="$(get_enabled_modules)"
+    fi
+
+    local any_missing=0
+    local failed_modules=()
+    for module in ${modules_to_check}; do
+        local compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+        [[ -f "${compose_file}" ]] || continue
+
+        # Use `docker compose config --images` to enumerate the images
+        # this module actually wants pulled given the current profile
+        # selection. Hand-rolled grep over the YAML is the obvious
+        # alternative but breaks on profile-gated services: optional
+        # services like media's Lidarr (profiles: [lidarr]) and
+        # Notifiarr (profiles: [notifiarr]) declare images but won't
+        # start unless the profile is active. Including them in the
+        # missing-check makes warm-path restarts emit a spurious
+        # "Fetching images for module: media" + a long pull every
+        # time, even though those services aren't running. compose's
+        # own enumeration knows about profiles + env interpolation,
+        # which is exactly what we want.
+        local images_list
+        if [[ -f "${OB_ENV_FILE}" ]]; then
+            images_list=$(OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True \
+                docker compose --env-file "${OB_ENV_FILE}" -p openbox \
+                -f "${compose_file}" config --images 2>/dev/null)
+        else
+            images_list=$(OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True \
+                docker compose -p openbox -f "${compose_file}" config --images 2>/dev/null)
+        fi
+        local missing=0
+        while IFS= read -r img; do
+            [[ -z "${img}" ]] && continue
+            if ! docker image inspect "${img}" &>/dev/null; then
+                missing=1
+                break
+            fi
+        done <<< "${images_list}"
+
+        if [[ ${missing} -eq 1 ]]; then
+            any_missing=1
+            log_info "Fetching images for module: ${module}"
+            local attempt=1
+            local pull_rc=1
+            while [[ ${attempt} -le 3 ]]; do
+                if [[ ${attempt} -gt 1 ]]; then
+                    log_warn "  pull attempt ${attempt}/3 (previous attempt failed) — retrying in $((attempt * 5))s"
+                    sleep $((attempt * 5))
+                fi
+                if [[ -f "${OB_ENV_FILE}" ]]; then
+                    OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True \
+                        docker compose --env-file "${OB_ENV_FILE}" -p openbox \
+                        -f "${compose_file}" pull
+                    pull_rc=$?
+                else
+                    OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True \
+                        docker compose -p openbox -f "${compose_file}" pull
+                    pull_rc=$?
+                fi
+                if [[ ${pull_rc} -eq 0 ]]; then
+                    break
+                fi
+                attempt=$((attempt + 1))
+            done
+            if [[ ${pull_rc} -ne 0 ]]; then
+                failed_modules+=("${module}")
+                log_error "Failed to pull images for module '${module}' after 3 attempts."
+                log_error "Likely causes: no internet access from this host, Docker Hub rate limit, or insufficient disk space."
+                log_error "Try: docker pull <image:tag> manually, or check 'docker info' for disk pressure."
+            fi
+        fi
+    done
+
+    if [[ ${#failed_modules[@]} -gt 0 ]]; then
+        log_error "Image prefetch failed for: ${failed_modules[*]}. Aborting before compose up to give a clean error."
+        return 1
+    fi
+    if [[ ${any_missing} -eq 1 ]]; then
+        log_ok "All required images present."
+    fi
+    return 0
+}
+
+# --- Shared operation lock (same file as dashboard server.js) ---
+# Prevents CLI and dashboard from running concurrent mutations
+# (openbox up + dashboard module-enable, backup + backup, etc.)
+_OB_LOCK_FILE="${OB_STATE_DIR}/operation.lock"
+cli_acquire_lock() {
+    local op_name="${1:-cli}"
+    # Caller already holds the lock (e.g. dashboard spawning openbox up).
+    # Skip our own check so we don't deadlock against a parent that's
+    # waiting for us to do the work it just queued.
+    if [[ "${OB_SKIP_LOCK:-}" == "1" ]]; then
+        return 0
+    fi
+    if [[ -f "${_OB_LOCK_FILE}" ]]; then
+        local lock_age=$(( $(date +%s) - $(stat -c %Y "${_OB_LOCK_FILE}" 2>/dev/null || echo 0) ))
+        # Codex round 3 finding #7: the old "age > 600s = stale, rm it"
+        # logic ignored the recorded PID. A real long-running operation
+        # (dashboard helper backing up 50GB, compose recreating a
+        # 20-module stack) could still be alive past 10 minutes, and
+        # clobbering its lock allowed a concurrent destructive command.
+        # Mirror the dashboard's PID-alive check: if the recorded pid
+        # is still running, keep the lock regardless of age.
+        local lock_pid=""
+        if command -v python3 &>/dev/null; then
+            lock_pid=$(python3 -c "import json,sys
+try:
+  d=json.load(open('${_OB_LOCK_FILE}'))
+  print(d.get('pid',''))
+except: pass" 2>/dev/null)
+        fi
+        if [[ -z "${lock_pid}" ]]; then
+            # Fallback parser for hosts without python3.
+            lock_pid=$(grep -oE '"pid"[[:space:]]*:[[:space:]]*[0-9]+' "${_OB_LOCK_FILE}" 2>/dev/null | grep -oE '[0-9]+' | head -1)
+        fi
+        if [[ -n "${lock_pid}" ]] && kill -0 "${lock_pid}" 2>/dev/null; then
+            log_error "Another OpenBox task (pid ${lock_pid}) is still running (started ${lock_age}s ago)."
+            log_error "Wait for it to finish. If the process is actually gone, delete the lock: rm ${_OB_LOCK_FILE}"
+            return 1
+        fi
+        if [[ ${lock_age} -lt 600 ]] && [[ -z "${lock_pid}" ]]; then
+            # No PID recorded, fresh lock — assume a peer is running and back off.
+            log_error "Another OpenBox task is still running (started ${lock_age}s ago)."
+            log_error "Wait for it to finish. If nothing has changed after 10 minutes, run 'openbox doctor' before removing the lock."
+            return 1
+        fi
+        rm -f "${_OB_LOCK_FILE}"
+    fi
+    echo "{\"name\":\"${op_name}\",\"pid\":$$,\"startedAt\":$(date +%s)000}" > "${_OB_LOCK_FILE}"
+}
+cli_release_lock() {
+    # If the caller pre-acquired the lock, they own its lifecycle. Don't
+    # release on their behalf.
+    [[ "${OB_SKIP_LOCK:-}" == "1" ]] && return 0
+    rm -f "${_OB_LOCK_FILE}"
+}
+
+# --- Commands ---
+
+prepare_module_config_dirs() {
+    local puid pgid
+    puid=$(grep -E '^PUID=' "${OB_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2)
+    pgid=$(grep -E '^PGID=' "${OB_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2)
+    puid="${puid:-1000}"
+    pgid="${pgid:-1000}"
+
+    local touched=0
+    for module in $(get_enabled_modules); do
+        local compose_file="${OB_ROOT}/modules/${module}/docker-compose.yml"
+        [[ -f "${compose_file}" ]] || continue
+        local prefix="${OB_ROOT}/modules/${module}/config"
+        # Grep every volume source that points at modules/<mod>/config/<svc>.
+        # Tolerates both ${OB_ROOT:-default}/... and literal paths.
+        local dirs
+        # Use bash parameter expansion instead of sed for the substitution:
+        # sed interprets `&` and backrefs in its replacement arg, so an
+        # OB_ROOT containing shell metacharacters (`/tmp/a&b`) would
+        # expand incorrectly. Bash `${var//pattern/repl}` treats the
+        # replacement as a literal — punchlist P3 2026-04-21.
+        dirs=$(grep -oE '(\$\{OB_ROOT[^}]*\}|/[^:[:space:]]+)?/modules/[^/]+/config/[^:[:space:]]+' "${compose_file}" 2>/dev/null \
+            | while IFS= read -r _line; do
+                _clean="${_line//\$\{OB_ROOT:-/opt/openbox\}/${OB_ROOT}}"
+                _clean="${_clean//\$\{OB_ROOT\}/${OB_ROOT}}"
+                _clean="${_clean//\$OB_ROOT/${OB_ROOT}}"
+                printf '%s\n' "${_clean}"
+              done \
+            | sort -u || true)
+        # Empty dirs → skip the read loop entirely to avoid the bash
+        # `<<< ""` pitfall under `set -e` (an empty heredoc still yields
+        # one iteration with an empty var, and mkdir -p '' then fails).
+        [[ -z "${dirs}" ]] && continue
+        while IFS= read -r dir; do
+            [[ -z "${dir}" ]] && continue
+            # Only touch paths inside this module's config/
+            [[ "${dir}" == "${prefix}/"* ]] || continue
+            # Skip paths that are meant to be FILE bind-mounts, not
+            # directories. Compose mounts things like
+            # .../portainer-admin-password as a secret file, and any
+            # name containing -password, -secret, .env, or .conf is
+            # almost certainly a file. If the path already exists as
+            # a regular file, leave it alone — docker will mount it as
+            # a file correctly.
+            if [[ -f "${dir}" && ! -d "${dir}" ]]; then
+                continue
+            fi
+            case "${dir}" in
+                *-password|*-secret|*.env|*.conf|*.pem|*.key|*.txt|*.yml|*.yaml|*.json|*.cert|*.crt|*.pfx|*.p12|*.htpasswd|*.htaccess|Dockerfile|docker-compose.yml)
+                    # Likely a FILE bind-mount, not a directory. If we
+                    # mkdir'd this Docker would refuse to mount the file
+                    # on top of our directory, AND install.sh's attempt
+                    # to write the config file would fail with
+                    # "Is a directory" (exactly the beta-finding that
+                    # re-surfaced in Codex review on 2026-04-21 for
+                    # metrics/config/prometheus.yml).
+                    continue
+                    ;;
+            esac
+            # Only chown if the dir is newly-created OR the current
+            # ownership doesn't match PUID:PGID. Previously chowned
+            # every dir on every `openbox up`, which clobbered an
+            # operator's intentionally-customized ownership (e.g. a
+            # dir deliberately set to a service-specific UID).
+            # Punchlist P3 2026-04-21.
+            if [[ -d "${dir}" ]]; then
+                current_owner=$(stat -c '%u:%g' "${dir}" 2>/dev/null || echo "")
+                if [[ "${current_owner}" != "${puid}:${pgid}" ]]; then
+                    chown "${puid}:${pgid}" "${dir}" 2>/dev/null && touched=$((touched + 1)) || true
+                fi
+            else
+                mkdir -p "${dir}" 2>/dev/null
+                chown "${puid}:${pgid}" "${dir}" 2>/dev/null && touched=$((touched + 1)) || true
+            fi
+        done <<< "${dirs}"
+    done
+    [[ "${touched}" -gt 0 ]] && log_info "Prepared ${touched} module config dir(s) for PUID=${puid} PGID=${pgid}" || true
+}
+
+# v1.6.73: ensure the dashboard's session-store directory exists on the
+# host with PUID:PGID ownership before ob-dashboard boots. The
+# express-session file store at dashboard/server.js's SessionFileStore
+# DOES try to mkdir its session dir on construction, but the catch is
+# silent — if the host bind mount points at a non-existent or
+# permission-locked path, the mkdir fails, every login then errors with
+# ENOENT on writeFile, and the cascade leaves operation.lock in a state
+# that prevents bootstrap-claim from completing. Caught live in #8929
+# (notrike) — session ENOENTs filling ob-dashboard's logs while a
+# stuck "Another first-run claim is in progress" 409 blocked his admin
+# password setup.
+prepare_dashboard_state_dirs() {
+    local puid pgid
+    puid=$(grep -E '^PUID=' "${OB_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2)
+    pgid=$(grep -E '^PGID=' "${OB_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2)
+    puid="${puid:-1000}"
+    pgid="${pgid:-1000}"
+    mkdir -p "${OB_ROOT}/state/sessions"
+    # v1.6.75: chown recursively on state/sessions so any pre-existing
+    # root-owned session files (e.g. left by an earlier failed install or
+    # a manual `mkdir` recovery) get reclaimed for the container PUID.
+    # The v1.6.73 non-recursive form fixed fresh installs but left
+    # in-between states broken — caught live in #8929 (notrike) where
+    # the dashboard cleared its ENOENTs but immediately started spewing
+    # EACCES on the same paths because the dir was root-owned.
+    chown "${puid}:${pgid}" "${OB_ROOT}/state" 2>/dev/null || true
+    chown -R "${puid}:${pgid}" "${OB_ROOT}/state/sessions" 2>/dev/null || true
+}
+
+# v1.6.69: validate MEDIA_ROOT before docker-compose ingests it.
+# docker-compose substitutes ${MEDIA_ROOT} into volumes lines unquoted, so a
+# whitespace character in the path splits the bind-mount arg and every
+# container comes up with the media volume bound to nothing. Reported in
+# #8628 (unfied) where MEDIA_ROOT pointed at "/mnt/nas_smb/Nas 2" — the
+# install completed, every container reported healthy, but no media was
+# visible inside any of them. Reject early at `openbox up` with a clear
+# remedy instead of letting compose silently misbehave.
+validate_media_root() {
+    if [[ ! -f "${OB_ENV_FILE}" ]]; then
+        return 0
+    fi
+    local media_root
+    media_root=$(grep '^MEDIA_ROOT=' "${OB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || echo "")
+    if [[ -z "${media_root}" ]]; then
+        return 0
+    fi
+    if [[ "${media_root}" =~ [[:space:]] ]]; then
+        log_error "MEDIA_ROOT contains whitespace: '${media_root}'"
+        echo "" >&2
+        echo "  docker-compose substitutes \${MEDIA_ROOT} into volume lines without quoting," >&2
+        echo "  so any space in the path splits the bind-mount arg. Containers come up but" >&2
+        echo "  the media volume binds to nothing — no files visible inside." >&2
+        echo "" >&2
+        echo "  Fix it with a no-space symlink, then point .env at the symlink:" >&2
+        echo "" >&2
+        echo "    sudo ln -sf '${media_root}' /mnt/openbox-media" >&2
+        echo "    sudo sed -i 's|^MEDIA_ROOT=.*|MEDIA_ROOT=/mnt/openbox-media|' ${OB_ENV_FILE}" >&2
+        echo "    sudo ${0} up" >&2
+        echo "" >&2
+        exit 1
+    fi
+}
+
+cmd_up() {
+    # OB_DEBUG_ENV=1 (set by cold-install rehearsal) opens a per-pid log
+    # of cmd_up entry/exit + the active modules.conf at start. Used to
+    # diagnose the dashboard-enable-noop bug where the 2nd+ enable's
+    # spawned `openbox up` returns 202 from the API but the container
+    # never appears. Customer installs don't set OB_DEBUG_ENV so this
+    # is a no-op for them.
+    if [[ "${OB_DEBUG_ENV:-}" == "1" ]]; then
+        local _dbg="${OB_STATE_DIR}/debug-cmd-up.log"
+        {
+            echo "=== cmd_up start $(date -Iseconds) pid=$$ ==="
+            echo "args: $*"
+            echo "cwd: $(pwd)"
+            echo "OB_ROOT=${OB_ROOT} OB_HOST_ROOT=${OB_HOST_ROOT} OB_SKIP_LOCK=${OB_SKIP_LOCK:-} OB_ENV_FILE=${OB_ENV_FILE}"
+            echo "modules.conf: $(get_enabled_modules | tr '\n' ' ')"
+            echo "ppid=$PPID parent-cmd: $(cat /proc/$PPID/cmdline 2>/dev/null | tr '\0' ' ')"
+        } >> "${_dbg}" 2>/dev/null || true
+    fi
+    cli_acquire_lock "cli-up" || exit 1
+    trap 'cli_release_lock' EXIT
+
+    # v1.6.82: hard-fail when we can't write to OB_STATE_DIR. Forum #8799
+    # chime-in (GamerX06, 2026-05-10): ran `openbox up` without sudo on a
+    # NerdPlex install at /opt/openbox, hit Permission denied on .env-hash,
+    # and the Portainer self-heal block silently half-failed because its
+    # writes are wrapped in `2>/dev/null || true` to survive other failure
+    # modes — which means perm-denied just gets eaten. User ends up with a
+    # broken Portainer admin login and no signal that the root cause was
+    # missing sudo. Catch it up front with a clear error instead.
+    if ! ( mkdir -p "${OB_STATE_DIR}" 2>/dev/null \
+           && touch "${OB_STATE_DIR}/.perm-check" 2>/dev/null \
+           && rm -f "${OB_STATE_DIR}/.perm-check" 2>/dev/null ); then
+        log_error "Cannot write to ${OB_STATE_DIR} — openbox up needs to run as root."
+        log_error "Re-run with sudo:    sudo $0 up $*"
+        exit 1
+    fi
+
+    banner
+
+    # v1.6.69: reject MEDIA_ROOT with whitespace before compose runs (see
+    # validate_media_root above for the full why).
+    validate_media_root
+
+    # Codex 2026-04-24 round 2 finding #8: if the first positional arg
+    # is a valid OpenBox module name, treat it as a module selector
+    # rather than a compose service name. Before this, callers like
+    # dashboard/lib/updates.js rollback code did `openbox up media`
+    # expecting to up only the media module; instead `media` was passed
+    # as a compose service name to every module's compose file, which
+    # failed with "no such service: media" for every non-media module
+    # and made targeted rollback unreliable. Explicit module selection
+    # was missing at the CLI level, so add it here. Trailing args
+    # continue to pass through as compose flags (e.g. --force-recreate).
+    local target_module=""
+    if [[ $# -gt 0 ]] && is_valid_module "$1"; then
+        target_module="$1"
+        shift
+    fi
+
+    log_info "Starting OpenBox..."
+
+    # v1.6.35: migrate any legacy `privacy` umbrella install to the
+    # split pihole/vaultwarden/authelia modules. Idempotent — does
+    # nothing on already-migrated or never-had-privacy systems. Runs
+    # BEFORE we log "Active modules" so the printed list reflects the
+    # new names, not the soon-to-be-rewritten legacy state.
+    migrate_privacy_split
+
+    if [[ -n "${target_module}" ]]; then
+        log_info "Targeted up: ${target_module}"
+    else
+        log_info "Active modules: $(get_enabled_modules | tr '\n' ' ')"
+    fi
+    echo ""
+
+    # Ensure the shared ob_proxy network exists. All modules attach to it as
+    # external, so it must be created before compose up. Pin it to
+    # 172.20.0.0/24 — without an explicit subnet, Docker auto-assigns
+    # whatever's free starting at /16, which on a clean host lands on
+    # 172.20.0.0/16 and greedy-overlaps every module's hardcoded /24
+    # (media wants 172.20.5.0/24, jellyfin 172.20.7.0/24, etc.), so
+    # `openbox up` dies with "Pool overlaps with other one on this
+    # address space" when enabling any second module. Caught by fresh
+    # media-enable test on 2026-04-21.
+    if ! docker network inspect ob_proxy &>/dev/null; then
+        log_info "Creating ob_proxy network (172.20.0.0/24)..."
+        docker network create --subnet=172.20.0.0/24 ob_proxy >/dev/null
+    fi
+
+    # 2026-04-21 beta review fix: pre-create + chown every module's
+    # config/<svc>/ bind-mount target to PUID:PGID BEFORE docker compose
+    # can autocreate them as root. Without this, services that run as a
+    # non-root user (seerr: `node`; linuxserver.io images: PUID) crash
+    # on first write with EACCES. The dashboard's own enable-flow tries
+    # to do the same thing but runs as the unprivileged `node` user
+    # inside its container and hits EPERM; the CLI runs on the host as
+    # root so it actually works. Idempotent — chown is a no-op when the
+    # ownership is already correct.
+    prepare_module_config_dirs
+
+    # v1.6.73: ensure dashboard session dirs exist with PUID:PGID owner
+    # before ob-dashboard boots — see prepare_dashboard_state_dirs above.
+    prepare_dashboard_state_dirs
+
+    # 2026-04-28 (v1.5.119): re-render every enabled module's templated
+    # configs on every `openbox up`. Previously render_module_templates
+    # only ran on `openbox enable <module>` — so if that initial render
+    # silently failed (or if a customer's compose started the container
+    # before our render landed), the module's image would self-write its
+    # default example config to disk and stay there forever. First paid
+    # customer's Authelia stayed dead with a 59KB image-default config
+    # despite our 65-line template existing on his box. Re-running the
+    # render is idempotent + cheap (just templating .env into a few yml
+    # files) and self-heals this whole class of bug going forward.
+    for _enabled_mod in $(get_enabled_modules); do
+        render_module_templates "${_enabled_mod}"
+    done
+    unset _enabled_mod
+
+    # 2026-05-04 (v1.6.34): pre-fetch images for modules with anything
+    # missing, before invoking compose up. Previously we relied on
+    # `docker compose up -d`'s implicit pull for first-time module
+    # enables. That has three problems:
+    #   1. No retry — a single transient registry hiccup (DNS blip,
+    #      Docker Hub 502, slow connection on a NAS pulling 600MB cold)
+    #      kills the whole `up` with exit 1.
+    #   2. No useful progress in the dashboard log — the user sees
+    #      "Starting OpenBox... Active modules: ..." then nothing for
+    #      30+ seconds while compose pulls, then a generic exit-1.
+    #   3. Pull errors get folded into compose's mixed output stream
+    #      so neither the user nor the dashboard can tell whether the
+    #      failure was a pull, a port bind, a config error, etc.
+    # Caught live 2026-05-04 when paid customer enabled the privacy
+    # module on a NAS that had to pull pihole + vaultwarden + authelia
+    # all at once. `docker pull` of the same images on the same host
+    # seconds later succeeded; the dashboard install simply hadn't
+    # waited long enough on the cold pull. Fix: explicit pull pass
+    # with up-to-3 retries and visible progress, only triggered when
+    # an image is actually missing so warm-path restarts stay fast.
+    local _prefetch_rc=0
+    if [[ -z "${target_module}" ]]; then
+        prefetch_missing_module_images || _prefetch_rc=$?
+    else
+        prefetch_missing_module_images "${target_module}" || _prefetch_rc=$?
+    fi
+    if [[ ${_prefetch_rc} -ne 0 ]]; then
+        # Bail before compose up — the user/dashboard already saw the
+        # specific "Failed to pull images for module X" error from
+        # prefetch_missing_module_images, no point burying it under a
+        # subsequent compose error too.
+        return ${_prefetch_rc}
+    fi
+
+    # 2026-04-25 fresh-install Surfshark gluetun bug: when the user sets
+    # VPN credentials in Settings AFTER the first `compose up -d` already
+    # created ob-gluetun (e.g. install enabled media before VPN values
+    # were filled), the next `up -d` does NOT recreate the container —
+    # docker compose only tracks the compose YAML's content for recreate
+    # decisions, NOT the resolved values from --env-file. Result: gluetun
+    # stays crashlooping with empty WIREGUARD_PRIVATE_KEY even after the
+    # operator saved their key to .env.
+    #
+    # Fix: hash .env on every `up`. If the hash differs from the last
+    # successful up (or no record exists), pass --force-recreate so every
+    # container gets reborn with fresh-interpolated env. Once a clean up
+    # completes we record the new hash.
+    local env_hash_file="${OB_STATE_DIR}/.env-hash"
+    local current_env_hash=""
+    local last_env_hash=""
+    local force_recreate_args=()
+    if [[ -f "${OB_ENV_FILE}" ]]; then
+        current_env_hash=$(sha256sum "${OB_ENV_FILE}" 2>/dev/null | cut -d' ' -f1)
+    fi
+    if [[ -f "${env_hash_file}" ]]; then
+        last_env_hash=$(cat "${env_hash_file}" 2>/dev/null | tr -d '[:space:]')
+    fi
+    # Only trigger --force-recreate when there's a PREVIOUS recorded hash
+    # that differs. On the very first up after install, we don't want to
+    # punish the cold path with an unnecessary recreate — there's nothing
+    # to recreate anyway.
+    if [[ -n "${current_env_hash}" && -n "${last_env_hash}" && "${current_env_hash}" != "${last_env_hash}" ]]; then
+        # Don't double-add if the caller already passed --force-recreate.
+        if ! printf '%s\n' "$@" | grep -qx -- '--force-recreate'; then
+            force_recreate_args=(--force-recreate)
+            log_info ".env changed since last up — recreating containers to pick up new values"
+        fi
+    fi
+
+    # Diagnostic (rehearsal): show what compose will see at the moment
+    # of interpolation. Only emits if OB_DEBUG_ENV=1 in the environment.
+    # Strips secrets except for shape (key + "set"/"empty").
+    if [[ "${OB_DEBUG_ENV:-}" == "1" ]] && [[ -f "${OB_ENV_FILE}" ]]; then
+        log_info "[DEBUG] env-file shape at compose time:"
+        for key in WIREGUARD_PRIVATE_KEY WIREGUARD_ADDRESSES VPN_PROVIDER VPN_TYPE SERVER_COUNTRIES OB_INSTALL_ID; do
+            # `|| true` because grep returns 1 (set -e + pipefail abort
+            # the script otherwise) when the key isn't in .env. That's
+            # an expected case — the whole point is to log "missing".
+            local v=""
+            v=$(grep -E "^${key}=" "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2- || true)
+            if [[ -z "$v" ]]; then
+                log_info "[DEBUG]   ${key}=<missing or empty>"
+            else
+                log_info "[DEBUG]   ${key}=<set, ${#v} chars>"
+            fi
+        done
+        log_info "[DEBUG] hash now=${current_env_hash:0:12}… last=${last_env_hash:0:12}…"
+    fi
+
+    # Caught live during 2026-04-25 cold-install rehearsal:
+    # docker-compose interpolation gives PRIORITY to shell env over
+    # --env-file values. The dashboard's loadEnvFromDisk pulls EVERY
+    # line from .env into process.env at startup, including empty
+    # placeholder lines like `WIREGUARD_PRIVATE_KEY=` that install.sh
+    # seeds. When the dashboard later spawns `openbox up` after the
+    # wizard saves real VPN credentials, the child inherits those
+    # empty shell vars, which then beat the --env-file's populated
+    # values. Result: gluetun is created with WIREGUARD_PRIVATE_KEY=""
+    # even though .env has the right key on disk.
+    #
+    # Fix: unset any module-level env vars in our own shell before
+    # invoking compose. The list below covers every var the included
+    # module composes reference. New module vars must be added here
+    # if they ship with empty placeholder lines in install.sh's .env.
+    # SB_*-prefixed vars stay intact because dashboard process.env
+    # does need them (compose forwards OB_INSTALL_ID etc.).
+    unset VPN_PROVIDER VPN_TYPE VPN_USER VPN_PASSWORD \
+          WIREGUARD_PRIVATE_KEY WIREGUARD_ADDRESSES \
+          WIREGUARD_PUBLIC_KEY WIREGUARD_PRESHARED_KEY \
+          SERVER_COUNTRIES SERVER_CITIES SERVER_HOSTNAMES SERVER_REGIONS \
+          VPN_PORT_FORWARDING \
+          FIREWALL_VPN_INPUT_PORTS
+
+    if [[ "${OB_DEBUG_ENV:-}" == "1" ]]; then
+        echo "[$(date -Iseconds)] pid=$$ about to invoke compose; target=${target_module:-<all>} force_recreate=${force_recreate_args[*]:-<none>}" >> "${OB_STATE_DIR}/debug-cmd-up.log" 2>/dev/null || true
+    fi
+    local _up_rc=0
+    if [[ -n "${target_module}" ]]; then
+        # Single-module up: run compose against just that module's file.
+        local compose_file="${OB_MODULES_DIR}/${target_module}/docker-compose.yml"
+        if [[ ! -f "${compose_file}" ]]; then
+            log_error "Compose file not found for module: ${target_module}"
+            exit 1
+        fi
+        if [[ -f "${OB_ENV_FILE}" ]]; then
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
+        else
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose -p openbox -f "${compose_file}" up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
+        fi
+    else
+        run_compose_per_module up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
+    fi
+
+    # Record the env hash AFTER a clean up so a half-failed run doesn't
+    # mask a future legitimate-recreate on retry.
+    if [[ ${_up_rc} -eq 0 && -n "${current_env_hash}" ]]; then
+        mkdir -p "${OB_STATE_DIR}" 2>/dev/null
+        printf '%s\n' "${current_env_hash}" > "${env_hash_file}" 2>/dev/null || true
+    fi
+
+    if [[ "${OB_DEBUG_ENV:-}" == "1" ]]; then
+        echo "[$(date -Iseconds)] pid=$$ compose returned rc=${_up_rc}" >> "${OB_STATE_DIR}/debug-cmd-up.log" 2>/dev/null || true
+    fi
+
+    if [[ ${_up_rc} -ne 0 ]]; then
+        return ${_up_rc}
+    fi
+
+    echo ""
+    log_ok "OpenBox is running!"
+    echo ""
+
+    # 2026-04-28 (v1.5.119): self-heal portainer admin password file
+    # if it's missing or somehow ended up as a directory. Root cause
+    # of the directory-instead-of-file case: install.sh hashes via
+    # `docker run httpd:alpine`, which silently failed when v1.5.115/117
+    # had broken container egress (no NAT for ob_proxy → docker pull
+    # times out → hash never writes → docker bind-mount auto-creates
+    # the path as a directory). This block regenerates the hash on
+    # the next up cycle whenever the file isn't a valid file. Egress
+    # is now fixed in v1.5.118 so the hash should succeed; if it
+    # doesn't, we just log_warn and keep going (portainer falls back
+    # to its first-run wizard).
+    local _portainer_secret="${OB_ROOT}/modules/core/config/portainer-admin-password"
+    # v1.6.68: widened self-heal trigger. Previously only fired on
+    # missing-file, which missed two real failure modes Demox beta tester
+    # `openboxfan` hit on 2026-05-08:
+    #   (a) Empty file — install.sh's hash chain returned empty, no file
+    #       was written, and Docker's bind-mount auto-created the host
+    #       path as an empty regular file (Compose v2 behavior on some
+    #       distros, vs the directory-creation v1 had).
+    #   (b) Non-bcrypt content — host had a stale plaintext or other
+    #       garbage left by an earlier failed install/recovery attempt.
+    # In both cases the secret-as-file existed but Portainer rejected it
+    # silently, fell back to its first-run wizard, the wizard timed out
+    # at ~5min, and the user couldn't ever log in. Treat anything that
+    # doesn't start with a real bcrypt prefix ($2a$/$2b$/$2y$) as broken.
+    #
+    # When we regenerate, also nuke ${OB_ROOT}/modules/core/config/portainer
+    # (the Portainer /data volume). Reason: if Portainer was running with
+    # a broken hash, its DB is in one of two states — empty (wizard never
+    # completed) or wizard-expired-locked. Either way nuking is correct,
+    # because an active admin would imply the secret was working in the
+    # first place. The user has nothing in Portainer to lose.
+    # v1.6.101: detection logic flipped. The secret file now contains
+    # PLAINTEXT (Portainer 2.41 hashes internally), so a bcrypt-prefix
+    # value indicates a file left behind by v1.6.100-or-earlier install
+    # that needs to be regenerated. Upgrading users auto-heal on next
+    # `openbox up`. Healthy state = non-empty file that does NOT start
+    # with $2a$/$2b$/$2y$.
+    local _portainer_needs_heal=0
+    if [[ ! -f "${_portainer_secret}" ]]; then
+        _portainer_needs_heal=1
+    elif [[ ! -s "${_portainer_secret}" ]]; then
+        _portainer_needs_heal=1
+    elif head -c 4 "${_portainer_secret}" 2>/dev/null | grep -qE '^\$2[aby]\$'; then
+        # Legacy bcrypt-format file from v1.6.100 or earlier. Portainer
+        # 2.41 would store this AS the plaintext password, so the admin
+        # account effectively has the bcrypt string as its password and
+        # the saved state/portainer-admin-password.txt no longer works.
+        # Auto-regenerate.
+        _portainer_needs_heal=1
+    fi
+    if (( _portainer_needs_heal == 1 )); then
+        log_info "Portainer secret missing or invalid — regenerating..."
+        rm -rf "${_portainer_secret}" 2>/dev/null
+        mkdir -p "$(dirname "${_portainer_secret}")"
+        # v1.6.101: write PLAINTEXT, not bcrypt hash. Portainer 2.41
+        # changed --admin-password-file semantics; full context in
+        # cmd_repair_portainer's comment. The earlier sanity-check above
+        # (line ~1328) that gates this branch on a `^\$2[aby]\$` bcrypt
+        # prefix is now intentionally over-broad — it'll false-trigger
+        # on a healthy plaintext file too. That's tolerable: this branch
+        # also stops + wipes Portainer's DB before restarting, so even
+        # an unnecessary heal still produces a working install. The
+        # sanity check can be relaxed in v1.7.x once we're confident
+        # nobody's still on v1.6.100-or-earlier bcrypt-style files.
+        local _ppw=""
+        _ppw=$(openssl rand -base64 24 2>/dev/null | tr -d '/+=' | head -c 16)
+        if [[ -n "${_ppw}" ]]; then
+            printf '%s' "${_ppw}" > "${_portainer_secret}"
+            chmod 600 "${_portainer_secret}"
+            mkdir -p "${OB_ROOT}/state"
+            printf 'username: admin\npassword: %s\n' "${_ppw}" > "${OB_ROOT}/state/portainer-admin-password.txt"
+            chmod 600 "${OB_ROOT}/state/portainer-admin-password.txt"
+            log_ok "Portainer admin password regenerated (state/portainer-admin-password.txt)"
+            # Stop ob-portainer + wipe /data so the new admin password
+            # is actually consumed on next start. Portainer only honors
+            # --admin-password-file when no admin exists yet in /data.
+            docker rm -f ob-portainer 2>/dev/null || true
+            rm -rf "${OB_ROOT}/modules/core/config/portainer" 2>/dev/null || true
+            mkdir -p "${OB_ROOT}/modules/core/config/portainer"
+            local _core_compose="${OB_ROOT}/modules/core/docker-compose.yml"
+            if [[ -f "${_core_compose}" ]]; then
+                docker compose -p openbox -f "${_core_compose}" up -d portainer >/dev/null 2>&1 || true
+            fi
+        else
+            log_warn "openssl rand failed; Portainer admin password not regenerated."
+        fi
+    fi
+
+    # v1.6.85: heal qBittorrent's DefaultSavePath when it's still
+    # pointing at /downloads (qBit's pre-v1.6.81 default). After
+    # v1.6.81 unified the *arr media bind to ${MEDIA_ROOT}:/data, the
+    # legacy /downloads path inside qBit is no longer host-bound —
+    # files land in the container's writable layer (lost on restart)
+    # AND Sonarr/Radarr can't see them. Surfaced 2026-05-10 when
+    # notrike (DM) reported every *arr download erroring with
+    # "qBittorrent places downloads in /downloads but this directory
+    # does not appear to exist inside the container."
+    #
+    # Fresh installs since v1.6.81 are fixed by arr-bootstrap.sh's
+    # API call (sets save_path to /data/downloads on first run).
+    # But arr-bootstrap is one-shot per install — anyone who
+    # upgraded from <v1.6.81 keeps the broken qBit conf forever.
+    # This heal block catches them on the next `openbox up`.
+    # Idempotent: matching lines only fire once because we rewrite
+    # them to the fixed value, and subsequent runs see the fixed
+    # value and don't match.
+    local _qbit_conf="${OB_ROOT}/modules/media/config/qbittorrent/qBittorrent/qBittorrent.conf"
+    if [[ -f "${_qbit_conf}" ]] && grep -qE '^Session\\(DefaultSavePath|TempPath)=/downloads' "${_qbit_conf}"; then
+        log_info "Healing qBittorrent save path (was /downloads, fixing to /data/downloads)..."
+        # Stop qBit first so it doesn't clobber the edits on shutdown.
+        docker stop ob-qbittorrent >/dev/null 2>&1 || true
+        awk '
+            /^Session\\DefaultSavePath=\/downloads\/?$/ { print "Session\\DefaultSavePath=/data/downloads"; next }
+            /^Session\\TempPath=\/downloads\/incomplete\/?$/ { print "Session\\TempPath=/data/downloads/incomplete/"; next }
+            { print }
+        ' "${_qbit_conf}" > "${_qbit_conf}.tmp" && mv "${_qbit_conf}.tmp" "${_qbit_conf}"
+        # Restart qBit so the new conf is loaded.
+        local _media_compose="${OB_ROOT}/modules/media/docker-compose.yml"
+        if [[ -f "${_media_compose}" ]] && [[ -f "${OB_ENV_FILE}" ]]; then
+            OB_ROOT="${OB_HOST_ROOT}" docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${_media_compose}" up -d qbittorrent >/dev/null 2>&1 || true
+        fi
+        log_ok "qBittorrent save path migrated to /data/downloads."
+    fi
+
+    # Post-up hook: auto-fire arr-bootstrap when media is enabled
+    # and hasn't been wired yet. arr-bootstrap does the full
+    # *arr-stack wiring + media-autoseed (Jellyfin wizard + Seerr
+    # sign-in + state/jellyfin-admin-password.txt) + media-finish
+    # (Jellyfin Movies/TV libraries). Idempotent via the state
+    # marker so re-runs are no-ops.
+    #
+    # Must truly detach — the parent `openbox up` is spawned by
+    # the dashboard's modules.enableStreaming, and when that parent
+    # bash exits our background process dies with it unless we
+    # escape the parent's process group. Use `setsid nohup` same
+    # as /api/setup/complete — this is the only pattern that
+    # reliably survives mid-arr-bootstrap dashboard container
+    # recreates.
+    #
+    # The `: [starting] ...` log line runs BEFORE arr-bootstrap so
+    # we can tell from the log whether the auto-fire triggered at
+    # all vs. arr-bootstrap itself failing. Before v1.5.54 a subshell
+    # + disown pattern silently produced no process and no log.
+    # Patch the Seerr React bundle every time the media stack comes up.
+    # Seerr ships a "redirect to /login on any SWR error" useEffect
+    # that false-logs users out on transient network blips (Brave's
+    # HTTPS-upgrade churn, slow Jellyfin sync, etc.). patch-seerr-bundle.sh
+    # neutralizes that specific expression. Idempotent — skips if
+    # already patched, re-runs on Seerr image updates (bundle filename
+    # changes per version so a new hash means re-patch).
+    if is_module_enabled "media" \
+       && [[ -x "${OB_ROOT}/scripts/patch-seerr-bundle.sh" ]]; then
+        "${OB_ROOT}/scripts/patch-seerr-bundle.sh" >/dev/null 2>&1 || true
+    fi
+
+    # Patch Jellyfin's index.html so its web UI drops stale cached
+    # server entries when the user accesses Jellyfin from a different
+    # URL than they previously connected to. Without this, customers
+    # who connect via LAN IP, then via NPM domain, then via VPN end
+    # up with multiple cached servers and land on the "Select Server"
+    # picker showing entries that no longer respond. patch-jellyfin-html.sh
+    # injects a tiny script into <head> that nukes the apiclient cache
+    # on load if it doesn't reference the current origin. Idempotent.
+    if is_module_enabled "media" \
+       && [[ -x "${OB_ROOT}/scripts/patch-jellyfin-html.sh" ]]; then
+        "${OB_ROOT}/scripts/patch-jellyfin-html.sh" >/dev/null 2>&1 || true
+    fi
+
+    # FileBrowser admin password rotation. Default is admin/admin until
+    # filebrowser-init.sh updates it (Codex audit finding #10, fixed
+    # 2026-05-01). Runs once when the files module is enabled and the
+    # init marker is absent. Idempotent script (skips on marker).
+    if is_module_enabled "files" \
+       && [[ ! -f "${OB_ROOT}/state/filebrowser-initted" ]] \
+       && [[ -x "${OB_ROOT}/scripts/filebrowser-init.sh" ]]; then
+        "${OB_ROOT}/scripts/filebrowser-init.sh" >/dev/null 2>&1 || true
+    fi
+
+    # Recyclarr / TRaSH-Guides defaults. Imports curated quality
+    # profiles + custom formats into Sonarr and Radarr from the
+    # TRaSH-Guides upstream. Without this, OpenBox ships stock
+    # "HD-1080p" defaults, which Reddit will tell anyone are junk.
+    # Phase 15 of 2026-05-01 deep-audit (top finding from Phase 10
+    # upstream-projects research). Idempotent — marker-gated;
+    # opt-out via OB_RECYCLARR_DISABLED=1 in .env. Runs ONLY after
+    # arr-bootstrap completes (state/arr-bootstrapped present),
+    # otherwise the *arr API keys aren't on disk yet.
+    if is_module_enabled "media" \
+       && [[ -f "${OB_ROOT}/state/arr-bootstrapped" ]] \
+       && [[ ! -f "${OB_ROOT}/state/recyclarr-synced" ]] \
+       && [[ -x "${OB_ROOT}/scripts/recyclarr-sync.sh" ]]; then
+        "${OB_ROOT}/scripts/recyclarr-sync.sh" >/dev/null 2>&1 || true
+    fi
+
+    if is_module_enabled "media" \
+       && [[ ! -f "${OB_ROOT}/state/arr-bootstrapped" ]] \
+       && [[ -x "${OB_ROOT}/scripts/arr-bootstrap.sh" ]]; then
+        log_info "Auto-firing arr-bootstrap in the background (~90-180s)..."
+        log_info "Jellyfin + Seerr credentials will appear in the launcher modals when ready."
+        mkdir -p "${OB_ROOT}/state"
+        echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] cmd_up auto-fire: launching arr-bootstrap.sh" >> "${OB_ROOT}/state/arr-bootstrap.log"
+        # When cmd_up runs inside the dashboard container (via /api/setup/
+        # complete's detached spawn), arr-bootstrap.sh cannot execute
+        # natively: no python3, the /127.0.0.1:<arr-port> URLs don't
+        # resolve to the /arr containers (that's gluetun's host port),
+        # /opt/openbox is unmounted, and pre-script bind mounts are ro.
+        # So dispatch into a helper container that has:
+        #   • Full /opt/openbox bind-mounted (for state writes, config)
+        #   • docker.sock (for `docker exec ob-sonarr …` patterns)
+        #   • openbox_ob_media network (so ob-gluetun:7878 etc resolve)
+        #   • python3 + bash + curl (pre-installed)
+        # Detected by absence of /opt/openbox from the perspective of
+        # the caller (host has it, dashboard container doesn't).
+        if [[ -d /opt/openbox && "${OB_HOST_ROOT}" == "/opt/openbox" ]]; then
+            # Host context — run natively at the standard path
+            setsid nohup bash "${OB_ROOT}/scripts/arr-bootstrap.sh" \
+                >>"${OB_ROOT}/state/arr-bootstrap.log" 2>&1 </dev/null &
+        elif [[ -d "${OB_HOST_ROOT}" ]] && [[ "${OB_HOST_ROOT}" == "${OB_ROOT}" ]]; then
+            # Host context with custom install dir (e.g. /srv/openbox).
+            # Same as above but using the actual install path, not
+            # hardcoded /opt/openbox. Codex audit finding #2 (2026-05-01):
+            # custom dirs were silently routed through the dashboard-helper
+            # branch with /opt/openbox hardcoded, breaking ARR bootstrap
+            # for any non-default install.
+            setsid nohup bash "${OB_ROOT}/scripts/arr-bootstrap.sh" \
+                >>"${OB_ROOT}/state/arr-bootstrap.log" 2>&1 </dev/null &
+        else
+            # Dashboard-container context — dispatch via docker run with
+            # host bind mount and media-network attached. Uses APPS_PORT_HOST
+            # localhost curls — those still work because we resolve each
+            # /arr via gluetun inside the helper's openbox_ob_media namespace.
+            # alpine:3.19 base is ~8MB; apk-add adds ~15s on first run (cached
+            # thereafter). Future optimization: pre-build a pinned image and
+            # push to ghcr.io so cold-starts drop to ~3s.
+            #
+            # IMPORTANT: bind-mount and OB_ROOT inside the helper MUST use
+            # OB_HOST_ROOT (the real host path from .env), not /opt/openbox.
+            # Customer with --install-dir /srv/openbox would otherwise see
+            # bootstrap "succeed" against an empty /opt/openbox while their
+            # actual /srv/openbox stayed unwired. Codex finding #2.
+            setsid nohup docker run --rm --name ob-arr-bootstrap \
+                --network openbox_ob_media \
+                -v "${OB_HOST_ROOT}:${OB_HOST_ROOT}" \
+                -v /var/run/docker.sock:/var/run/docker.sock \
+                -e "OB_ROOT=${OB_HOST_ROOT}" \
+                -e ARR_USE_DOCKER_DNS=1 \
+                alpine:3.19 sh -c "
+                    apk add --no-cache bash curl python3 docker-cli docker-cli-compose >/dev/null 2>&1
+                    ${OB_HOST_ROOT}/scripts/arr-bootstrap.sh
+                " >>"${OB_ROOT}/state/arr-bootstrap.log" 2>&1 </dev/null &
+        fi
+        disown 2>/dev/null || true
+    fi
+
+    cmd_urls
+}
+
+cmd_down() {
+    log_info "Stopping OpenBox..."
+    run_compose_per_module down "$@"
+    log_ok "OpenBox stopped."
+}
+
+# --- Support session ---
+#
+# `openbox support enable` opens a 4-hour remote-support window:
+#   1. Mints a Tailscale pre-auth key from the OpenBox license worker
+#      (license-gated, audit-logged on Tom's side).
+#   2. Installs tailscale if missing, joins the OpenBox tailnet as
+#      an ephemeral node tagged tag:openbox-customer.
+#   3. Disables Tailscale's built-in SSH (--ssh=false) so OpenSSH
+#      owns port 22 and the operator's pubkey actually applies. The
+#      first paid customer's debug session lost an hour to this.
+#   4. Appends the operator's pubkey (shipped at support/tom-support-
+#      key.pub) to /root/.ssh/authorized_keys with a marker so we can
+#      cleanly remove it on disable.
+#   5. Schedules a systemd-timer-via-`at` to auto-call `support
+#      disable` after the window expires; if `at` isn't available,
+#      falls back to a backgrounded `sleep && disable`.
+#   6. Writes state/support.json with started/expires timestamps so
+#      the dashboard can show a banner + revoke button.
+#
+# Hard rules:
+#   - No silent enable. The customer triggers it via dashboard or CLI;
+#     the dashboard surfaces a confirmation modal on click.
+#   - Auto-disable always runs, even if the dashboard never opens
+#     again. The systemd timer / sleep fallback is the safety net.
+#   - `support disable` is one command; never makes the customer
+#     hunt down a process or edit authorized_keys themselves.
+cmd_support() {
+    local sub="${1:-status}"
+    shift 2>/dev/null || true
+    case "${sub}" in
+        enable)  cmd_support_enable "$@" ;;
+        disable) cmd_support_disable "$@" ;;
+        status)  cmd_support_status "$@" ;;
+        *)
+            log_error "Usage: openbox support {enable|disable|status} [--json] [--hours N]"
+            exit 1
+            ;;
+    esac
+}
+
+# Helper: where the worker lives. Override with OB_SUPPORT_API_URL
+# for staging tests. Default is webhook.crushcodeworks.com which already
+# hosts /validate, /support/auth-key, etc.
+_support_api_url() {
+    echo "${OB_SUPPORT_API_URL:-https://webhook.crushcodeworks.com/support/auth-key}"
+}
+
+# Helper: where the operator's authorized pubkey lives in the install.
+_support_pubkey_path() {
+    echo "${OB_ROOT}/support/tom-support-key.pub"
+}
+
+# Helper: marker we tag the appended authorized_keys line with so
+# `support disable` can remove exactly the line we added — never
+# accidentally stripping a key the customer manages themselves.
+_support_authkeys_marker() {
+    echo "# openbox-support"
+}
+
+# Helper: read the active license key from state/license.json.
+# Returns empty string if missing/unparseable. The worker rejects
+# unlicensed/invalid keys with 403 so we don't need to validate
+# locally — just pass whatever we have.
+_support_read_license_key() {
+    local lj="${OB_ROOT}/state/license.json"
+    [[ -f "${lj}" ]] || return 0
+    python3 -c "import json,sys
+try:
+  d=json.load(open('${lj}'))
+  print(d.get('key',''))
+except: pass" 2>/dev/null
+}
+
+# Helper: OB_INSTALL_ID from .env, first 8 chars. Used as the
+# Tailscale hostname suffix so Tom can ssh root@openbox-<id>
+# instead of memorizing 100.x.y.z addresses.
+_support_install_id_short() {
+    local id
+    id=$(grep -E '^OB_INSTALL_ID=' "${OB_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'")
+    echo "${id:0:8}"
+}
+
+cmd_support_enable() {
+    local hours=4 json_out=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --hours) hours="${2:-4}"; shift 2 ;;
+            --json)  json_out=1; shift ;;
+            *) shift ;;
+        esac
+    done
+    # Clamp to 1..8 — same window the worker enforces. Without this,
+    # `sudo openbox support enable --hours 999` would set a local
+    # 999-hour timer + state file while the worker's audit-log entry
+    # records only 4h, breaking the "Tom's KV log matches what the
+    # customer consented to" invariant. Codex audit catch.
+    if ! [[ "${hours}" =~ ^[0-9]+$ ]]; then hours=4; fi
+    if (( hours < 1 )); then hours=1; fi
+    if (( hours > 8 )); then hours=8; fi
+
+    if [[ "$(id -u)" != "0" ]]; then
+        log_error "support enable must run as root (try: sudo openbox support enable)"
+        exit 1
+    fi
+
+    # Already-enabled check. Don't double-add pubkeys or stack timers.
+    if [[ -f "${OB_ROOT}/state/support.json" ]] \
+       && python3 -c "import json,sys,time; d=json.load(open('${OB_ROOT}/state/support.json')); sys.exit(0 if d.get('enabled') and d.get('expires_at',0) > time.time() else 1)" 2>/dev/null; then
+        log_info "Support session already active. Run 'openbox support status' to see details, or 'support disable' to revoke."
+        cmd_support_status ${json_out:+--json}
+        return 0
+    fi
+
+    log_info "Opening support session (${hours}h)..."
+
+    # 1. Mint Tailscale pre-auth key from the worker.
+    local lic_key
+    lic_key=$(_support_read_license_key)
+    if [[ -z "${lic_key}" ]]; then
+        log_error "No license key found at state/license.json. Activate your license first."
+        exit 1
+    fi
+    local api_url
+    api_url=$(_support_api_url)
+    log_info "Requesting auth key from license server..."
+    local ts_key resp http_code
+    # Pipe the body via stdin (--data-binary @-) instead of -d on argv.
+    # `ps` and /proc/<pid>/cmdline expose argv to other local users,
+    # so the license key would otherwise be readable on a shared NAS
+    # for the lifetime of the curl process. stdin is private to the
+    # process pair.
+    resp=$(printf '{"license_key":"%s","hours":%d}' "${lic_key}" "${hours}" | \
+           curl -fsS -X POST -H 'Content-Type: application/json' \
+            --data-binary @- \
+            -w '\n__HTTP_CODE__:%{http_code}' \
+            --max-time 15 \
+            "${api_url}" 2>&1) || true
+    http_code=$(printf '%s' "${resp}" | grep -oE '__HTTP_CODE__:[0-9]+$' | cut -d: -f2)
+    resp=$(printf '%s' "${resp}" | sed '$d')
+    if [[ "${http_code}" != "200" ]]; then
+        log_error "License server rejected the support request (HTTP ${http_code:-?}): ${resp}"
+        exit 1
+    fi
+    ts_key=$(printf '%s' "${resp}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_key',''))" 2>/dev/null)
+    if [[ -z "${ts_key}" ]]; then
+        log_error "License server returned no auth key. Response: ${resp}"
+        exit 1
+    fi
+
+    # 2. Install Tailscale if missing.
+    if ! command -v tailscale >/dev/null 2>&1; then
+        log_info "Installing Tailscale..."
+        # Primary path: tailscale.com/install.sh (handles most distros)
+        curl -fsSL https://tailscale.com/install.sh | sh >/tmp/ob-tailscale-install.log 2>&1 || true
+
+        # Fallback for systems where apt-get install fails due to pre-existing
+        # broken dependencies (UGREEN UGOS Pro on Debian Bookworm: had
+        # qemu-block-extra unmet deps that blocked any apt-get install).
+        # Direct dpkg install of the .deb sidesteps apt's dep resolver.
+        # Caught 2026-04-30 on UGREEN test box.
+        if ! command -v tailscale >/dev/null 2>&1 && command -v dpkg >/dev/null 2>&1; then
+            log_info "apt path failed; trying direct .deb install..."
+            local arch
+            arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
+            # 1.88.4 was current stable as of 2026-04-30. The package archive
+            # keeps old versions, so this URL stays valid even after newer
+            # releases ship. OpenBox releases that touch this number should
+            # bump as needed; the install.sh primary path will normally
+            # supersede this fallback.
+            curl -fsSL "https://pkgs.tailscale.com/stable/debian/pool/tailscale_1.88.4_${arch}.deb" \
+                -o /tmp/ob-tailscale.deb 2>>/tmp/ob-tailscale-install.log
+            dpkg -i /tmp/ob-tailscale.deb >>/tmp/ob-tailscale-install.log 2>&1 || true
+            rm -f /tmp/ob-tailscale.deb
+        fi
+
+        if ! command -v tailscale >/dev/null 2>&1; then
+            log_error "Tailscale install failed. See /tmp/ob-tailscale-install.log."
+            log_error "Install manually: https://tailscale.com/download"
+            exit 1
+        fi
+    fi
+
+    # 3. Bring tailscale up. Ephemeral so the node auto-removes when
+    # offline. --ssh=false because Tailscale SSH overrides authorized_keys
+    # with its own ACL — we want OpenSSH to handle auth.
+    #
+    # 2026-04-28 (v1.5.123): the first paid customer's box was already
+    # registered to the operator's tailnet via legacy "share node" flow,
+    # so the new --auth-key=... up failed with "node already exists" —
+    # silently. We added the pubkey + wrote success state, but the box
+    # was actually OFFLINE from the tailnet. SSH was unreachable.
+    #
+    # Recovery now is layered:
+    #   a. Logout first (clean release of any prior tailnet membership)
+    #   b. Try `tailscale up`
+    #   c. Verify with `tailscale status` — backend state must be Running
+    #   d. If not Running: wipe /var/lib/tailscale/tailscaled.state to
+    #      force a fresh machine identity, mint a NEW auth key (the
+    #      first one is single-use and may be consumed), retry
+    #   e. If STILL not Running: fail loudly. Don't write success state.
+    #      Don't add the pubkey. (We've already added it before this
+    #      block; revert that on failure to keep state consistent.)
+    local install_id_short hostname
+    install_id_short=$(_support_install_id_short)
+    hostname="openbox-${install_id_short:-unknown}"
+    log_info "Joining tailnet as ${hostname}..."
+
+    # Helper: returns 0 only if tailscale up succeeded AND status reports
+    # BackendState=Running. Empty/Stopped/NeedsLogin all return 1.
+    _support_ts_up_and_verify() {
+        local key="$1" host="$2"
+        tailscale up \
+            --auth-key="${key}" \
+            --hostname="${host}" \
+            --ssh=false \
+            --accept-routes=false \
+            >/tmp/ob-support-up.log 2>&1 || return 1
+        sleep 2
+        local state
+        if command -v jq >/dev/null 2>&1; then
+            state=$(tailscale status --json 2>/dev/null | jq -r '.BackendState // ""')
+        else
+            # Text fallback: tailscale status prints "Logged out." on
+            # the magic health-check line if not registered.
+            if tailscale status 2>&1 | grep -qiE 'logged out|needs login|stopped'; then
+                state="Stopped"
+            else
+                state="Running"
+            fi
+        fi
+        [[ "${state}" == "Running" ]]
+    }
+
+    # Helper: re-mints a Tailscale auth key from the worker. Used on
+    # retry after state wipe — original key is single-use + may be
+    # consumed by a failed registration attempt.
+    _support_remint_auth_key() {
+        local r http
+        r=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+                -d "$(printf '{"license_key":"%s","hours":%d}' "${lic_key}" "${hours}")" \
+                -w '\n__HTTP_CODE__:%{http_code}' \
+                --max-time 15 \
+                "${api_url}" 2>&1) || return 1
+        http=$(printf '%s' "${r}" | grep -oE '__HTTP_CODE__:[0-9]+$' | cut -d: -f2)
+        r=$(printf '%s' "${r}" | sed '$d')
+        [[ "${http}" != "200" ]] && return 1
+        printf '%s' "${r}" | python3 -c "import sys,json; print(json.load(sys.stdin).get('auth_key',''))" 2>/dev/null
+    }
+
+    # Step a: clean logout. No-op if not logged in. Best-effort —
+    # if the daemon is in a stuck state we'll wipe in step d anyway.
+    tailscale logout >/dev/null 2>&1 || true
+
+    # Step b+c: up + verify.
+    if ! _support_ts_up_and_verify "${ts_key}" "${hostname}"; then
+        log_warn "Tailscale registration didn't take. Wiping local state for fresh machine identity..."
+        if [[ -s /tmp/ob-support-up.log ]]; then
+            head -5 /tmp/ob-support-up.log >&2 2>/dev/null || true
+        fi
+
+        # Step d: wipe state + restart tailscaled + remint key + retry.
+        systemctl stop tailscaled 2>/dev/null || service tailscaled stop 2>/dev/null || true
+        rm -f /var/lib/tailscale/tailscaled.state
+        systemctl start tailscaled 2>/dev/null || service tailscaled start 2>/dev/null || true
+        sleep 3
+
+        log_info "Requesting fresh auth key (prior key was consumed)..."
+        local ts_key2
+        ts_key2=$(_support_remint_auth_key)
+        if [[ -z "${ts_key2}" ]]; then
+            log_error "Could not re-mint Tailscale auth key. Check license worker logs."
+            exit 1
+        fi
+
+        if ! _support_ts_up_and_verify "${ts_key2}" "${hostname}"; then
+            log_error "Tailscale still not Running after wipe + retry. See journalctl -u tailscaled -n 50."
+            log_error "Support session NOT enabled. The customer can recover by running 'openbox support disable' (cleans up partial state)."
+            exit 1
+        fi
+        ts_key="${ts_key2}"  # for downstream logging consistency
+    fi
+
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null | head -1)
+
+    # 4. Append operator pubkey to /root/.ssh/authorized_keys.
+    local pub_path
+    pub_path=$(_support_pubkey_path)
+    if [[ ! -s "${pub_path}" ]]; then
+        log_error "Support pubkey missing or empty at ${pub_path}. Cannot grant access."
+        tailscale logout >/dev/null 2>&1 || true
+        exit 1
+    fi
+    mkdir -p /root/.ssh
+    chmod 700 /root/.ssh
+    touch /root/.ssh/authorized_keys
+    chmod 600 /root/.ssh/authorized_keys
+
+    # 4a. Ensure sshd allows root pubkey login. Some distros (Ubuntu
+    # 26.04, UGOS Pro on UGREEN) default to PermitRootLogin no, which
+    # rejects all root SSH regardless of key. Without this, the support
+    # pubkey is dutifully placed in authorized_keys but the operator's
+    # SSH attempt gets "Permission denied (publickey)" at the doorstep.
+    # Caught 2026-04-30 on UGREEN test box. Set to prohibit-password
+    # (key-only root login) — strictly safer than 'yes' (no password
+    # auth allowed) and required for the support flow to function.
+    if [[ -f /etc/ssh/sshd_config ]]; then
+        local restart_sshd=0
+        if grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+(no|forced-commands-only)' /etc/ssh/sshd_config; then
+            sed -i -E 's|^[[:space:]]*PermitRootLogin[[:space:]]+.*|PermitRootLogin prohibit-password|' /etc/ssh/sshd_config
+            restart_sshd=1
+        elif ! grep -qE '^[[:space:]]*PermitRootLogin[[:space:]]+' /etc/ssh/sshd_config; then
+            # Not configured at all — append explicit prohibit-password
+            echo 'PermitRootLogin prohibit-password' >> /etc/ssh/sshd_config
+            restart_sshd=1
+        fi
+        if [[ "${restart_sshd}" == "1" ]]; then
+            log_info "Updated sshd_config: PermitRootLogin prohibit-password (was no/missing)"
+            systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null || \
+                service sshd reload 2>/dev/null || service ssh reload 2>/dev/null || true
+        fi
+    fi
+    # Strip any prior support marker AND its following pubkey line, so
+    # a re-enable after a half-cleaned disable doesn't leave a stale
+    # operator pubkey orphaned in the file. The regex is anchored to
+    # the exact format we write below ('# openbox-support session=…
+    # expires=…' on its own line) so it can never match a customer's
+    # own keys, comments, or any other text. Codex caught this in
+    # 2026-04-28 audit: a loose `/marker/d` would also strip a customer
+    # key that happened to have '# openbox-support' in its comment.
+    local marker_re='^# openbox-support session=[0-9]{8}T[0-9]{6}Z expires=[0-9]{8}T[0-9]{6}Z$'
+    sed -i -E "/${marker_re}/,+1d" /root/.ssh/authorized_keys
+    {
+        printf '# openbox-support session=%s expires=%s\n' \
+            "$(date -u +%Y%m%dT%H%M%SZ)" \
+            "$(date -u -d "+${hours} hours" +%Y%m%dT%H%M%SZ 2>/dev/null || date -u -v+${hours}H +%Y%m%dT%H%M%SZ 2>/dev/null)"
+        cat "${pub_path}"
+    } >> /root/.ssh/authorized_keys
+
+    # 5. Auto-disable timer. Try `at` first; if `at` is missing OR `atd`
+    # is disabled (the schedule call returns non-zero), fall through to
+    # the nohup-sleep fallback. The bug Codex caught: previously we
+    # tested `command -v at` then ran `at | true`, swallowing the
+    # daemon-not-running error and leaving NO timer scheduled at all.
+    # Result: customer-consented 4-hour window silently became "until
+    # the next reboot" — pubkey + Tailscale stay live well past intent.
+    local expires_at_epoch=$(($(date -u +%s) + hours * 3600))
+    local _timer_scheduled=0
+    if command -v at >/dev/null 2>&1; then
+        if echo "bash '${OB_ROOT}/openbox' support disable" | at "now + ${hours} hours" >/dev/null 2>&1; then
+            _timer_scheduled=1
+        fi
+    fi
+    if [[ "${_timer_scheduled}" != "1" ]]; then
+        nohup bash -c "sleep $((hours * 3600)) && bash '${OB_ROOT}/openbox' support disable" </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+    fi
+
+    # 6. Persist state for dashboard + audit.
+    mkdir -p "${OB_ROOT}/state"
+    python3 -c "
+import json,time
+d={
+  'enabled':True,
+  'started_at':int(time.time()),
+  'expires_at':${expires_at_epoch},
+  'hostname':'${hostname}',
+  'tailscale_ip':'${ts_ip}',
+  'hours':${hours},
+}
+open('${OB_ROOT}/state/support.json','w').write(json.dumps(d,indent=2)+'\n')
+"
+    chmod 600 "${OB_ROOT}/state/support.json" 2>/dev/null || true
+    {
+        printf '[%s] enabled hours=%d hostname=%s ip=%s\n' \
+            "$(date -u -Is)" "${hours}" "${hostname}" "${ts_ip:-?}"
+    } >> "${OB_ROOT}/state/support.log"
+
+    log_ok "Support session active for ${hours}h. SSH: ${hostname} (${ts_ip:-pending})"
+    log_info "Tell Tom in Discord: 'support is on'"
+    log_info "Revoke at any time: sudo openbox support disable"
+
+    if [[ "${json_out}" == "1" ]]; then
+        cat "${OB_ROOT}/state/support.json"
+    fi
+}
+
+cmd_support_disable() {
+    local json_out=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json_out=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    if [[ "$(id -u)" != "0" ]]; then
+        log_error "support disable must run as root (try: sudo openbox support disable)"
+        exit 1
+    fi
+
+    log_info "Closing support session..."
+
+    # Strip the marker + the pubkey line that follows. Anchored regex
+    # — must match the EXACT format we wrote on enable, never any
+    # customer-managed line that happens to contain similar text.
+    if [[ -f /root/.ssh/authorized_keys ]]; then
+        local marker_re='^# openbox-support session=[0-9]{8}T[0-9]{6}Z expires=[0-9]{8}T[0-9]{6}Z$'
+        sed -i -E "/${marker_re}/,+1d" /root/.ssh/authorized_keys
+    fi
+
+    # Tailscale logout — ephemeral node will auto-disappear from the
+    # tailnet shortly. Idempotent: ok if already down.
+    if command -v tailscale >/dev/null 2>&1; then
+        tailscale logout >/dev/null 2>&1 || true
+    fi
+
+    # Cancel any pending `at` jobs we scheduled. Best-effort.
+    if command -v atq >/dev/null 2>&1 && command -v atrm >/dev/null 2>&1; then
+        atq 2>/dev/null | awk '{print $1}' | while read -r jobid; do
+            at -c "${jobid}" 2>/dev/null | grep -q 'support disable' && atrm "${jobid}" 2>/dev/null || true
+        done
+    fi
+
+    # Update state.
+    local now=$(date -u +%s)
+    if [[ -f "${OB_ROOT}/state/support.json" ]]; then
+        python3 -c "
+import json
+p='${OB_ROOT}/state/support.json'
+try:
+  d=json.load(open(p))
+except:
+  d={}
+d['enabled']=False
+d['ended_at']=${now}
+open(p,'w').write(json.dumps(d,indent=2)+'\n')
+" 2>/dev/null || rm -f "${OB_ROOT}/state/support.json"
+    fi
+    {
+        printf '[%s] disabled\n' "$(date -u -Is)"
+    } >> "${OB_ROOT}/state/support.log" 2>/dev/null || true
+
+    log_ok "Support session closed. Tom no longer has access."
+
+    if [[ "${json_out}" == "1" ]]; then
+        printf '{"enabled":false,"ended_at":%d}\n' "${now}"
+    fi
+}
+
+cmd_support_status() {
+    local json_out=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json_out=1; shift ;;
+            *) shift ;;
+        esac
+    done
+
+    local sj="${OB_ROOT}/state/support.json"
+    if [[ "${json_out}" == "1" ]]; then
+        if [[ -f "${sj}" ]]; then
+            cat "${sj}"
+        else
+            printf '{"enabled":false}\n'
+        fi
+        return 0
+    fi
+    if [[ ! -f "${sj}" ]]; then
+        echo "Support session: not active"
+        return 0
+    fi
+    python3 -c "
+import json,time
+d=json.load(open('${sj}'))
+if not d.get('enabled'):
+    print('Support session: not active')
+    print('  Last ended:', time.ctime(d.get('ended_at',0)) if d.get('ended_at') else 'never')
+else:
+    rem = max(0, d.get('expires_at',0) - int(time.time()))
+    h = rem // 3600
+    m = (rem % 3600) // 60
+    print('Support session: ACTIVE')
+    print('  Hostname:    ', d.get('hostname','?'))
+    print('  Tailscale IP:', d.get('tailscale_ip','?'))
+    print('  Expires in:  {}h {}m'.format(h, m))
+"
+}
+
+cmd_repair_network() {
+    log_info "Rebuilding OpenBox network and containers..."
+    run_compose_per_module down "$@" 2>/dev/null || true
+    if docker network inspect ob_proxy &>/dev/null; then
+        log_info "Removing ob_proxy network..."
+        docker network rm ob_proxy >/dev/null 2>&1 || true
+    fi
+    cmd_up "$@"
+    log_ok "Network rebuilt. Try license activation now."
+}
+
+cmd_status() {
+    banner
+    echo -e "${BOLD}Module Status:${NC}"
+    echo ""
+
+    for module in $(discover_modules); do
+        local title
+        title=$(read_openbox_field "${module}" "title")
+        [[ -z "${title}" ]] && title="${module}"
+        if is_module_enabled "${module}"; then
+            echo -e "  ${GREEN}●${NC} ${BOLD}${module}${NC} (enabled) - ${title}"
+        else
+            echo -e "  ${RED}○${NC} ${module} (disabled) - ${title}"
+        fi
+    done
+
+    echo ""
+    echo -e "${BOLD}Container Status:${NC}"
+    echo ""
+    docker ps --filter "name=sb-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || \
+        log_warn "Could not query Docker. Is Docker running?"
+}
+
+cmd_modules() {
+    banner
+    echo -e "${BOLD}Available Modules:${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Always Active:${NC}"
+    for module in $(get_core_modules); do
+        local title tagline
+        title=$(read_openbox_field "${module}" "title")
+        tagline=$(read_openbox_field "${module}" "tagline")
+        [[ -z "${title}" ]] && title="${module}"
+        echo -e "    ${GREEN}●${NC} ${BOLD}${module}${NC} - ${title}${tagline:+ -- ${tagline}}"
+    done
+
+    echo ""
+    echo -e "  ${BOLD}Optional:${NC}"
+    for module in $(get_optional_modules); do
+        local title tagline
+        title=$(read_openbox_field "${module}" "title")
+        tagline=$(read_openbox_field "${module}" "tagline")
+        [[ -z "${title}" ]] && title="${module}"
+
+        if is_module_enabled "${module}"; then
+            echo -e "    ${GREEN}●${NC} ${BOLD}${module}${NC} - ${title}${tagline:+ -- ${tagline}}"
+        else
+            echo -e "    ${RED}○${NC} ${module} - ${title}${tagline:+ -- ${tagline}}"
+        fi
+    done
+    echo ""
+}
+
+cmd_enable() {
+    local module="${1:-}"
+    if [[ -z "${module}" ]]; then
+        log_error "Usage: openbox enable <module>"
+        echo "Available modules:"
+        get_optional_modules | while read -r m; do
+            local title
+            title=$(read_openbox_field "${m}" "title")
+            echo "  ${m} - ${title}"
+        done
+        exit 1
+    fi
+
+    if ! is_valid_module "${module}"; then
+        log_error "Unknown module: ${module}"
+        # Check if the unknown name matches a service inside a composite
+        # bundle (e.g. "sonarr" → "media"). Surface the parent so users
+        # don't stare at the full Available list trying to guess.
+        local parent=""
+        for mod in $(get_optional_modules); do
+            local compose_file="${OB_MODULES_DIR}/${mod}/docker-compose.yml"
+            [[ -f "${compose_file}" ]] || continue
+            if awk -v svc="${module}" '
+                /^x-openbox:/ {in_meta=1; next}
+                /^[a-z]/ {in_meta=0}
+                in_meta && /^  services:/ {in_svc=1; next}
+                in_svc && /^    [a-z]/ {
+                    gsub(/:$/,"")
+                    sub(/^    /,"")
+                    if ($1 == svc) { print "match"; exit 0 }
+                }
+            ' "${compose_file}" | grep -q match; then
+                parent="${mod}"
+                break
+            fi
+        done
+        if [[ -n "${parent}" ]]; then
+            log_error "\"${module}\" is part of the \"${parent}\" bundle — enable \"${parent}\" instead."
+            exit 1
+        fi
+        echo "Available modules:"
+        get_optional_modules | while read -r m; do
+            local title
+            title=$(read_openbox_field "${m}" "title")
+            echo "  ${m} - ${title}"
+        done
+        exit 1
+    fi
+
+    if is_core_module "${module}"; then
+        log_warn "${module} is a core module and is always enabled."
+        return
+    fi
+
+    if is_module_enabled "${module}"; then
+        log_warn "${module} is already enabled."
+        return
+    fi
+
+    # Conflict check: standalone 'jellyfin' and 'media' both use port 8096
+    # and both provide Jellyfin. Only one should be enabled.
+    if [[ "${module}" == "jellyfin" ]] && is_module_enabled "media"; then
+        log_error "Cannot enable 'jellyfin' -- the 'media' module already includes Jellyfin."
+        log_info "The 'media' module provides Jellyfin along with Sonarr, Radarr, and other tools."
+        log_info "Use the standalone 'jellyfin' module only if you do NOT want the full media stack."
+        log_info "To switch, first disable media: openbox disable media"
+        return
+    fi
+    if [[ "${module}" == "media" ]] && is_module_enabled "jellyfin"; then
+        log_error "Cannot enable 'media' -- the standalone 'jellyfin' module is already enabled."
+        log_info "The 'media' module includes its own Jellyfin instance."
+        log_info "To switch, first disable jellyfin: openbox disable jellyfin"
+        return
+    fi
+
+    ensure_state_dir
+    echo "${module}" >> "${OB_MODULES_CONF}"
+
+    # Pre-create the module's config dir with PUID:PGID ownership so
+    # containers that run as non-root (n8n, linuxserver images, etc.)
+    # can write to bind-mounted volumes without permission errors.
+    local mod_config_dir="${OB_ROOT}/modules/${module}/config"
+    mkdir -p "${mod_config_dir}" 2>/dev/null || true
+    local puid pgid
+    # Use tail -1 to avoid picking up duplicate or stale lines
+    puid=$(grep '^PUID=' "${OB_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2)
+    pgid=$(grep '^PGID=' "${OB_ROOT}/.env" 2>/dev/null | tail -1 | cut -d= -f2)
+    [[ -z "${puid}" ]] && puid=1000
+    [[ -z "${pgid}" ]] && pgid=1000
+    chown -R "${puid}:${pgid}" "${mod_config_dir}" 2>/dev/null || true
+
+    # Render any template files this module needs. Without this, modules
+    # that require a seed config (authelia, prometheus) will start with
+    # the image's default sample config, which is usually broken.
+    render_module_templates "${module}"
+
+    log_ok "Module '${module}' enabled."
+    log_info "Run 'openbox up' to start the new module."
+
+    # arr-bootstrap is now auto-fired from cmd_up's post-up hook
+    # (v1.5.53) once all containers are up. No more manual
+    # copy-paste step for customers — arr-bootstrap runs in the
+    # background on the next `openbox up`, wires the *arr stack,
+    # drives Jellyfin's wizard via Playwright, signs Seerr in, and
+    # creates the libraries. State marker prevents re-runs.
+}
+
+render_module_templates() {
+    local module="$1"
+    local render_one
+    render_one() {
+        local src="$1" dest="$2"
+        [[ -f "${src}" ]] || return
+        mkdir -p "$(dirname "${dest}")"
+        local content
+        content=$(cat "${src}")
+        while IFS='=' read -r key value; do
+            [[ -z "${key}" || "${key}" =~ ^# ]] && continue
+            content="${content//\{\{${key}\}\}/${value}}"
+        done < "${OB_ROOT}/.env"
+        echo "${content}" > "${dest}"
+    }
+    case "${module}" in
+        authelia)
+            render_one "${OB_ROOT}/templates/authelia-config.yml.tmpl" \
+                       "${OB_ROOT}/modules/authelia/config/configuration.yml"
+            # Seed the users database if missing (admin / "openbox")
+            local users_db="${OB_ROOT}/modules/authelia/config/users_database.yml"
+            if [[ ! -f "${users_db}" ]]; then
+                mkdir -p "$(dirname "${users_db}")"
+                cat > "${users_db}" << 'AUTHUSERS'
+---
+users:
+  admin:
+    disabled: false
+    displayname: 'Admin'
+    password: '$argon2id$v=19$m=65536,t=3,p=4$BpLnfgDsc2WD8F2q$o/vzA4myCqZZ36bUGsDY//8mKUYNZZaR0t4MFFSs+iM'
+    email: admin@openbox.local
+    groups:
+      - admins
+AUTHUSERS
+            fi
+            ;;
+        metrics)
+            render_one "${OB_ROOT}/templates/prometheus-config.yml.tmpl" \
+                       "${OB_ROOT}/modules/metrics/config/prometheus.yml"
+            ;;
+    esac
+}
+
+cmd_disable() {
+    local module="${1:-}"
+    if [[ -z "${module}" ]]; then
+        log_error "Usage: openbox disable <module>"
+        exit 1
+    fi
+
+    if is_core_module "${module}"; then
+        log_error "Cannot disable core module: ${module}"
+        exit 1
+    fi
+
+    if ! is_module_enabled "${module}"; then
+        log_warn "${module} is not enabled."
+        return
+    fi
+
+    local compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+    if [[ -f "${compose_file}" ]]; then
+        log_info "Stopping ${module} containers..."
+        if [[ -f "${OB_ENV_FILE}" ]]; then
+            OB_ROOT="${OB_HOST_ROOT}" docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" down 2>/dev/null || true
+        else
+            OB_ROOT="${OB_HOST_ROOT}" docker compose -p openbox -f "${compose_file}" down 2>/dev/null || true
+        fi
+    fi
+
+    local tmp
+    tmp=$(mktemp)
+    grep -vx "${module}" "${OB_MODULES_CONF}" > "${tmp}" || true
+    mv "${tmp}" "${OB_MODULES_CONF}"
+
+    log_ok "Module '${module}' disabled."
+}
+
+cmd_restart() {
+    local module="${1:-}"
+
+    # Use `up -d --force-recreate` instead of `docker compose restart`.
+    # `restart` reuses the existing container with its original env, so
+    # anyone who enabled a module, THEN set env vars in .env (VPN creds
+    # being the canonical case) hit a silent "env didn't take" failure —
+    # gluetun in particular dies with "private key is not set" even
+    # though the .env value is correct. Caught on a fresh UGREEN install
+    # on 2026-04-21 after setting Surfshark creds post-enable. Force-
+    # recreate tears down the container + recreates with fresh env.
+    if [[ -z "${module}" ]]; then
+        log_info "Restarting all OpenBox services (recreating to pick up .env changes)..."
+        # Multi-file combined compose fails with "cannot override
+        # x-openbox.tips" when any two enabled modules both define the
+        # x-openbox extension block (most of them do). Per-module up is
+        # what the rest of the CLI already uses. Codex 2026-04-24 round 2
+        # finding #2.
+        run_compose_per_module up -d --force-recreate
+    else
+        if ! is_valid_module "${module}"; then
+            log_error "Unknown module: ${module}"
+            exit 1
+        fi
+
+        local compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+        if [[ -f "${compose_file}" ]]; then
+            log_info "Restarting module: ${module} (recreating to pick up .env changes)"
+            if [[ -f "${OB_ENV_FILE}" ]]; then
+                OB_ROOT="${OB_HOST_ROOT}" docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" up -d --force-recreate
+            else
+                OB_ROOT="${OB_HOST_ROOT}" docker compose -p openbox -f "${compose_file}" up -d --force-recreate
+            fi
+        fi
+    fi
+
+    # Re-apply Seerr + Jellyfin in-container patches. Both `restart` and
+    # `update` use `up -d --force-recreate` which TEARS DOWN and RECREATES
+    # containers from the original image. Anything we patched at runtime
+    # via `docker exec sed`/`docker exec node` is lost on recreate. The
+    # patch scripts are idempotent (skip if already applied) so calling
+    # them unconditionally is safe.
+    # Caught 2026-05-01 deep test pass: Seerr container was recreated by
+    # an earlier `openbox restart` run; cookie-name patch was wiped, and
+    # all our session-loss work would have regressed for customers on
+    # next update.
+    #
+    # Codex audit finding #8: patch failures used to be swallowed with
+    # `|| true`. Now we surface them — if a patch script exits non-zero
+    # (which it does when its sed/node patterns no longer match an
+    # upstream image change), `openbox restart` will warn loudly so
+    # the operator notices before customers regress.
+    local patch_fail=0
+    if [[ -z "${module}" ]] || [[ "${module}" == "media" ]]; then
+        if [[ -x "${OB_ROOT}/scripts/patch-seerr-bundle.sh" ]] && is_module_enabled media; then
+            if ! "${OB_ROOT}/scripts/patch-seerr-bundle.sh" >/dev/null 2>&1; then
+                log_warn "patch-seerr-bundle.sh failed — Seerr session-loss patches may not be applied."
+                log_warn "  Run manually + check output: sudo bash ${OB_ROOT}/scripts/patch-seerr-bundle.sh"
+                patch_fail=$((patch_fail+1))
+            fi
+        fi
+        if [[ -x "${OB_ROOT}/scripts/patch-jellyfin-html.sh" ]] && is_module_enabled media; then
+            if ! "${OB_ROOT}/scripts/patch-jellyfin-html.sh" >/dev/null 2>&1; then
+                log_warn "patch-jellyfin-html.sh failed — Jellyfin stale-cache patch may not be applied."
+                log_warn "  Run manually + check output: sudo bash ${OB_ROOT}/scripts/patch-jellyfin-html.sh"
+                patch_fail=$((patch_fail+1))
+            fi
+        fi
+    fi
+
+    if [[ ${patch_fail} -gt 0 ]]; then
+        log_warn "${patch_fail} runtime patch(es) failed to apply — see above."
+    fi
+    log_ok "Restart complete."
+}
+
+cmd_update() {
+    local module="${1:-}"
+
+    # --check flag: show available updates without applying
+    if [[ "${module}" == "--check" ]]; then
+        log_info "Checking for available updates..."
+        _save_pre_update_digests
+        # Per-module dry-run so each compose file is parsed alone —
+        # combined parse fails with "cannot override x-openbox.tips".
+        # Codex 2026-04-24 round 2 finding #2.
+        run_compose_per_module pull --dry-run 2>&1 || true
+        log_ok "Check complete. Run 'openbox update' to apply."
+        return
+    fi
+
+    # Save pre-update digests for dashboard rollback support
+    _save_pre_update_digests
+
+    if [[ -z "${module}" ]]; then
+        log_info "Pulling latest images for all enabled modules..."
+        # Per-module pull + up; combined compose fails with "cannot
+        # override x-openbox.tips". Codex 2026-04-24 round 2 #2.
+        run_compose_per_module pull
+        log_info "Recreating containers..."
+        run_compose_per_module up -d --force-recreate
+    else
+        if ! is_valid_module "${module}"; then
+            log_error "Unknown module: ${module}"
+            exit 1
+        fi
+
+        local compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+        if [[ -f "${compose_file}" ]]; then
+            log_info "Updating module: ${module}"
+            if [[ -f "${OB_ENV_FILE}" ]]; then
+                OB_ROOT="${OB_HOST_ROOT}" docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" pull
+                OB_ROOT="${OB_HOST_ROOT}" docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" up -d --force-recreate
+            else
+                OB_ROOT="${OB_HOST_ROOT}" docker compose -p openbox -f "${compose_file}" pull
+                OB_ROOT="${OB_HOST_ROOT}" docker compose -p openbox -f "${compose_file}" up -d --force-recreate
+            fi
+        fi
+    fi
+
+    # Re-apply Seerr + Jellyfin in-container patches after recreate.
+    # See cmd_restart for the same logic + rationale. Codex audit
+    # finding #8: failures now surface, no longer swallowed by `|| true`.
+    local patch_fail=0
+    if [[ -z "${module}" ]] || [[ "${module}" == "media" ]] || [[ "${module}" == "jellyfin" ]]; then
+        if [[ -x "${OB_ROOT}/scripts/patch-seerr-bundle.sh" ]] && is_module_enabled media; then
+            if ! "${OB_ROOT}/scripts/patch-seerr-bundle.sh" >/dev/null 2>&1; then
+                log_warn "patch-seerr-bundle.sh failed — Seerr session-loss patches may not be applied."
+                log_warn "  Run manually + check output: sudo bash ${OB_ROOT}/scripts/patch-seerr-bundle.sh"
+                patch_fail=$((patch_fail+1))
+            fi
+        fi
+        if [[ -x "${OB_ROOT}/scripts/patch-jellyfin-html.sh" ]]; then
+            if ! "${OB_ROOT}/scripts/patch-jellyfin-html.sh" >/dev/null 2>&1; then
+                log_warn "patch-jellyfin-html.sh failed — Jellyfin stale-cache patch may not be applied."
+                log_warn "  Run manually + check output: sudo bash ${OB_ROOT}/scripts/patch-jellyfin-html.sh"
+                patch_fail=$((patch_fail+1))
+            fi
+        fi
+    fi
+
+    if [[ ${patch_fail} -gt 0 ]]; then
+        log_warn "${patch_fail} runtime patch(es) failed to apply — see above."
+    fi
+
+    # qBit config heal: `openbox update` only pulls images + recreates
+    # containers — it doesn't touch the on-disk custom-cont-init.d script
+    # generated by install.sh. So users who upgraded from <= v1.4.12 via
+    # `openbox update` (instead of `curl|bash`) kept running the OLD
+    # init script with its early `exit 0` and never got
+    # HostHeaderValidation=false / CSRFProtection=false written to their
+    # qBit conf. Symptom: blank "Unauthorized" page on http://NAS:8089
+    # with no login form. Caught 2026-05-11 by squid (#37 unread DMs).
+    #
+    # CRITICAL ordering (v1.6.97): qBit saves its in-memory state to the
+    # conf on graceful shutdown (SIGTERM from `docker stop` / `docker
+    # restart`). If we edit while qBit is running and then restart, qBit's
+    # shutdown overwrites our edits. We MUST stop the container first,
+    # then edit, then start — that way qBit reads the edited conf fresh
+    # on startup, loads HostHeader/CSRF into memory, and from then on
+    # preserves them across shutdowns. v1.6.96 did edit-then-restart and
+    # the patch silently no-op'd for squid (confirmed in DM
+    # thread continuation, 2026-05-12).
+    if [[ -z "${module}" ]] || [[ "${module}" == "media" ]]; then
+        local qbit_conf="${OB_ROOT}/modules/media/config/qbittorrent/qBittorrent/qBittorrent.conf"
+        if [[ -f "${qbit_conf}" ]]; then
+            local needs_heal=0
+            grep -F 'HostHeaderValidation=' "${qbit_conf}" >/dev/null 2>&1 || needs_heal=1
+            grep -F 'CSRFProtection=' "${qbit_conf}" >/dev/null 2>&1 || needs_heal=1
+            if [[ "${needs_heal}" == "1" ]]; then
+                local qbit_was_running=0
+                if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ob-qbittorrent$'; then
+                    qbit_was_running=1
+                    docker stop ob-qbittorrent >/dev/null 2>&1 || true
+                fi
+                if ! grep -F 'HostHeaderValidation=' "${qbit_conf}" >/dev/null 2>&1; then
+                    if grep -q '^\[Preferences\]' "${qbit_conf}"; then
+                        awk '/^\[Preferences\]$/{print; print "WebUI\\HostHeaderValidation=false"; next} 1' "${qbit_conf}" > "${qbit_conf}.tmp" && mv "${qbit_conf}.tmp" "${qbit_conf}"
+                    else
+                        printf '\n[Preferences]\nWebUI\\HostHeaderValidation=false\n' >> "${qbit_conf}"
+                    fi
+                fi
+                if ! grep -F 'CSRFProtection=' "${qbit_conf}" >/dev/null 2>&1; then
+                    if grep -q '^\[Preferences\]' "${qbit_conf}"; then
+                        awk '/^\[Preferences\]$/{print; print "WebUI\\CSRFProtection=false"; next} 1' "${qbit_conf}" > "${qbit_conf}.tmp" && mv "${qbit_conf}.tmp" "${qbit_conf}"
+                    else
+                        printf '\n[Preferences]\nWebUI\\CSRFProtection=false\n' >> "${qbit_conf}"
+                    fi
+                fi
+                log_ok "qBittorrent: added HostHeaderValidation=false / CSRFProtection=false to existing conf."
+                if [[ "${qbit_was_running}" == "1" ]]; then
+                    docker start ob-qbittorrent >/dev/null 2>&1 || true
+                fi
+            fi
+        fi
+    fi
+
+    log_ok "Update complete."
+}
+
+# Save current image digests before update (for dashboard rollback)
+_save_pre_update_digests() {
+    local state_dir="${OB_ROOT}/state"
+    local digest_file="${state_dir}/pre-update-digests.json"
+    mkdir -p "${state_dir}"
+
+    # Build JSON of current container image IDs
+    local json="{"
+    local first=true
+    while IFS=$'\t' read -r name image imageId; do
+        [[ -z "${name}" ]] && continue
+        if [[ "${first}" == "true" ]]; then
+            first=false
+        else
+            json+=","
+        fi
+        json+="\"${name}\":{\"image\":\"${image}\",\"imageId\":\"${imageId}\"}"
+    done < <(docker ps --filter "name=sb-" --format "{{.Names}}\t{{.Image}}\t{{.ID}}" 2>/dev/null)
+    json+="}"
+
+    echo "${json}" > "${digest_file}"
+}
+
+cmd_reset() {
+    # Usage:
+    #   openbox reset                 — default: stops all, removes containers/networks, keeps data
+    #   openbox reset --soft          — same as default
+    #   openbox reset --hard          — also removes /data, .env, state, backups (FULL WIPE)
+    #   openbox reset --nuke          — also removes the install directory itself
+    #   openbox reset --yes           — skip confirmation prompt
+    #
+    # Always keeps Docker itself installed.
+
+    local mode="soft"
+    local skip_confirm=false
+
+    for arg in "$@"; do
+        case "${arg}" in
+            --soft)   mode="soft" ;;
+            --hard)   mode="hard" ;;
+            --nuke)   mode="nuke" ;;
+            --yes|-y) skip_confirm=true ;;
+            *)
+                log_error "Unknown reset flag: ${arg}"
+                echo "Usage: openbox reset [--soft|--hard|--nuke] [--yes]"
+                exit 1
+                ;;
+        esac
+    done
+
+    echo ""
+    log_warn "OpenBox Reset — ${mode} mode"
+    echo ""
+    case "${mode}" in
+        soft)
+            echo "This will:"
+            echo "  - Stop all OpenBox containers"
+            echo "  - Remove all ob-* containers"
+            echo "  - Remove sb_* Docker networks"
+            echo "  - KEEP: /data, .env, state, backups, and the install directory"
+            echo ""
+            echo "After this, 'openbox up' will start everything fresh."
+            ;;
+        hard)
+            echo "This will:"
+            echo "  - Stop all OpenBox containers"
+            echo "  - Remove all ob-* containers and networks"
+            echo "  - Remove /data (media, configs, databases)"
+            echo "  - Remove .env (passwords, license, secrets)"
+            echo "  - Remove state/ and backups/"
+            echo "  - Remove module config/ subdirectories"
+            echo "  - KEEP: the openbox install directory itself"
+            echo ""
+            log_error "THIS WILL DELETE ALL YOUR DATA. No undo."
+            ;;
+        nuke)
+            echo "This will:"
+            echo "  - Everything in --hard mode, PLUS:"
+            echo "  - Remove the entire install directory (${OB_ROOT})"
+            echo "  - Remove the /usr/local/bin/openbox symlink"
+            echo "  - Remove pulled Docker images (optional cleanup)"
+            echo ""
+            log_error "THIS WILL COMPLETELY WIPE OPENBOX. Fresh install required afterward."
+            ;;
+    esac
+    echo ""
+
+    if [[ "${skip_confirm}" != "true" ]]; then
+        read -rp "Type 'YES' to confirm: " confirm
+        if [[ "${confirm}" != "YES" ]]; then
+            log_info "Reset cancelled."
+            exit 0
+        fi
+    fi
+
+    echo ""
+    log_info "Stopping all OpenBox services..."
+    # Per-module down; combined compose parse fails with "cannot
+    # override x-openbox.tips" on multi-module installs. Codex
+    # 2026-04-24 round 2 finding #2. The dashboard's subsequent
+    # `docker rm ob-*` pass catches any stragglers anyway.
+    run_compose_per_module down --remove-orphans 2>/dev/null || true
+
+    log_info "Removing any remaining ob-* containers..."
+    local containers
+    containers=$(docker ps -a --filter "name=sb-" --format "{{.Names}}" 2>/dev/null || true)
+    if [[ -n "${containers}" ]]; then
+        while IFS= read -r container; do
+            [[ -z "${container}" ]] && continue
+            docker rm -f "${container}" 2>/dev/null || true
+        done <<< "${containers}"
+    fi
+
+    log_info "Removing sb_* Docker networks..."
+    local networks
+    networks=$(docker network ls --filter "name=sb_" --format "{{.Name}}" 2>/dev/null || true)
+    if [[ -n "${networks}" ]]; then
+        while IFS= read -r network; do
+            [[ -z "${network}" ]] && continue
+            docker network rm "${network}" 2>/dev/null || true
+        done <<< "${networks}"
+    fi
+
+    if [[ "${mode}" == "hard" ]] || [[ "${mode}" == "nuke" ]]; then
+        log_warn "Removing data directories..."
+
+        # Remove data
+        if [[ -d "${OB_ROOT}/data" ]]; then
+            rm -rf "${OB_ROOT}/data"
+            log_ok "Removed ${OB_ROOT}/data"
+        fi
+
+        # Remove .env (but keep .env.example)
+        if [[ -f "${OB_ROOT}/.env" ]]; then
+            rm -f "${OB_ROOT}/.env"
+            log_ok "Removed ${OB_ROOT}/.env"
+        fi
+
+        # Remove state
+        if [[ -d "${OB_ROOT}/state" ]]; then
+            rm -rf "${OB_ROOT}/state"
+            log_ok "Removed ${OB_ROOT}/state"
+        fi
+
+        # Remove backups
+        if [[ -d "${OB_ROOT}/backups" ]]; then
+            rm -rf "${OB_ROOT}/backups"
+            log_ok "Removed ${OB_ROOT}/backups"
+        fi
+
+        # Remove module config directories (but not the module code)
+        for config_dir in "${OB_ROOT}"/modules/*/config; do
+            [[ -d "${config_dir}" ]] && rm -rf "${config_dir}" && log_ok "Removed $(basename "$(dirname "${config_dir}")")/config"
+        done
+    fi
+
+    if [[ "${mode}" == "nuke" ]]; then
+        log_warn "Removing CLI symlink..."
+        if [[ -L /usr/local/bin/openbox ]]; then
+            rm -f /usr/local/bin/openbox 2>/dev/null || sudo rm -f /usr/local/bin/openbox 2>/dev/null || true
+            log_ok "Removed /usr/local/bin/openbox"
+        fi
+
+        log_warn "Removing pulled Docker images..."
+        # Identify OpenBox-owned images precisely instead of greping
+        # `docker images` for substrings like "pihole" or "tailscale".
+        # The substring approach also matched unrelated host workloads
+        # (e.g. an unrelated `myorg/pihole-monitor:v1` would be deleted),
+        # surprising users who run other Docker apps next to OpenBox.
+        # Two authoritative sources, unioned:
+        #   1. `image:` lines from each module's compose file (precise
+        #      repo:tag actually configured by OpenBox).
+        #   2. Images currently bound to any ob-* container, in case an
+        #      auto-update pulled a tag newer than what the compose file
+        #      lists at this moment.
+        local images=""
+        if [[ -d "${OB_ROOT}/modules" ]]; then
+            images=$(grep -hE '^\s*image:\s*' "${OB_ROOT}"/modules/*/docker-compose.yml 2>/dev/null \
+                | sed -E 's/.*image:[[:space:]]*"?([^"#[:space:]]+)"?.*/\1/' \
+                | sort -u)
+        fi
+        local container_images
+        container_images=$(docker ps -a --filter 'name=^sb-' --format '{{.Image}}' 2>/dev/null | sort -u || true)
+        images=$(printf '%s\n%s\n' "${images}" "${container_images}" | sort -u | grep -v '^$' || true)
+        if [[ -n "${images}" ]]; then
+            while IFS= read -r image; do
+                [[ -z "${image}" ]] && continue
+                docker rmi -f "${image}" 2>/dev/null || true
+            done <<< "${images}"
+            log_ok "Docker images removed"
+        fi
+
+        log_warn "Removing install directory..."
+        local parent_dir
+        parent_dir=$(dirname "${OB_ROOT}")
+        cd "${parent_dir}" || exit 1
+        rm -rf "${OB_ROOT}"
+        log_ok "Removed ${OB_ROOT}"
+
+        echo ""
+        log_ok "OpenBox completely nuked."
+        log_info "To reinstall: curl -fsSL https://crushcodeworks.com/install.sh | bash"
+        exit 0
+    fi
+
+    echo ""
+    log_ok "Reset complete (${mode} mode)."
+    if [[ "${mode}" == "soft" ]]; then
+        log_info "Run 'openbox up' to start services again."
+    else
+        log_info "Run 'openbox install' (or the setup wizard) to reconfigure."
+    fi
+}
+
+# Factory reset — "give me a fresh start without losing my license or
+# the media I already have." Wipes module configs + state + sessions so
+# the dashboard boots into the first-run wizard, but keeps:
+#   - .env (license key + admin password hash + module passwords)
+#   - backups/ (so a bad install can be rolled back)
+#   - /data (media files — wiping terabytes by accident is not a button)
+#
+# If you actually want those gone too, use `reset --hard` or `reset --nuke`.
+cmd_factory_reset() {
+    local skip_confirm=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y) skip_confirm=true ;;
+            *) log_error "Unknown option: $1"; exit 1 ;;
+        esac
+        shift
+    done
+
+    echo ""
+    log_warn "OpenBox Factory Reset"
+    echo ""
+    echo "This will:"
+    echo "  - Stop all OpenBox containers"
+    echo "  - Remove ob-* containers and sb_* networks"
+    echo "  - Wipe state/ (chat sessions, module API keys, wizard state, etc.)"
+    echo "  - Wipe every module's config/ and data/ subdirectory"
+    echo "  - Reset modules.conf back to core-only"
+    echo ""
+    echo "KEEPS:"
+    echo "  - .env (so your license key and admin password still work)"
+    echo "  - backups/ (safe rollback still available)"
+    echo "  - /data (your media files)"
+    echo ""
+    log_info "After this, the dashboard will boot into the first-run setup wizard."
+    echo ""
+
+    if [[ "${skip_confirm}" != "true" ]]; then
+        read -rp "Type 'YES' to confirm: " confirm
+        if [[ "${confirm}" != "YES" ]]; then
+            log_info "Factory reset cancelled."
+            exit 0
+        fi
+    fi
+
+    echo ""
+    log_info "Stopping all OpenBox services..."
+    # Per-module down; combined compose parse fails with "cannot
+    # override x-openbox.tips" on multi-module installs. Codex
+    # 2026-04-24 round 2 finding #2. The dashboard's subsequent
+    # `docker rm ob-*` pass catches any stragglers anyway.
+    run_compose_per_module down --remove-orphans 2>/dev/null || true
+
+    log_info "Removing any remaining ob-* containers..."
+    local containers
+    containers=$(docker ps -a --filter "name=sb-" --format "{{.Names}}" 2>/dev/null || true)
+    if [[ -n "${containers}" ]]; then
+        while IFS= read -r container; do
+            [[ -z "${container}" ]] && continue
+            docker rm -f "${container}" 2>/dev/null || true
+        done <<< "${containers}"
+    fi
+
+    log_info "Removing sb_* Docker networks..."
+    local networks
+    networks=$(docker network ls --filter "name=sb_" --format "{{.Name}}" 2>/dev/null || true)
+    if [[ -n "${networks}" ]]; then
+        while IFS= read -r network; do
+            [[ -z "${network}" ]] && continue
+            docker network rm "${network}" 2>/dev/null || true
+        done <<< "${networks}"
+    fi
+
+    # Wipe state/ contents — but preserve the directory itself so the
+    # dashboard doesn't fail a mkdir-exists check on restart.
+    if [[ -d "${OB_ROOT}/state" ]]; then
+        log_warn "Wiping state/..."
+        rm -rf "${OB_ROOT}"/state/*  "${OB_ROOT}"/state/.[!.]* 2>/dev/null || true
+        log_ok "Wiped ${OB_ROOT}/state/ (kept dir)"
+    fi
+
+    # Wipe each module's config/ and data/ — module CODE (compose files,
+    # entrypoints) stays on disk so re-enable works without a reinstall.
+    log_warn "Wiping module config/data..."
+    for mod_dir in "${OB_ROOT}"/modules/*/; do
+        [[ -d "${mod_dir}config" ]] && rm -rf "${mod_dir}config" 2>/dev/null || true
+        [[ -d "${mod_dir}data" ]] && rm -rf "${mod_dir}data" 2>/dev/null || true
+    done
+    log_ok "Wiped module config/ and data/"
+
+    # Reset modules.conf to core-only so only the essentials come up on
+    # the post-reset `openbox up`.
+    mkdir -p "${OB_ROOT}/state"
+    printf 'core\ndashboard\n' > "${OB_ROOT}/state/modules.conf"
+    log_ok "Reset modules.conf to core-only"
+
+    echo ""
+    log_ok "Factory reset complete."
+    log_info "Starting core services..."
+    "${OB_ROOT}/openbox" up 2>&1 | tail -20
+    echo ""
+    log_ok "Done. The dashboard will load the first-run wizard on next visit."
+    log_info "Log in with your existing admin password — it's been preserved."
+}
+
+cmd_logs() {
+    local service="${1:-}"
+
+    if [[ -z "${service}" ]]; then
+        log_error "Usage: openbox logs <service>"
+        echo "Examples: openbox logs ob-pihole"
+        exit 1
+    fi
+
+    docker logs -f --tail 100 "${service}"
+}
+
+cmd_backup() {
+    local config_only=false
+    local dest_dir="${OB_BACKUP_DIR}"
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --config-only) config_only=true; shift ;;
+            --dest)
+                if [[ -z "${2:-}" ]]; then
+                    log_error "--dest requires a path (USB drive, network share, etc.)"
+                    exit 1
+                fi
+                dest_dir="$2"; shift 2 ;;
+            *) log_error "Unknown flag: $1. Usage: openbox backup [--config-only] [--dest /path/to/drive]"; exit 1 ;;
+        esac
+    done
+
+    local timestamp
+    timestamp="$(backup_timestamp)"
+    mkdir -p "${dest_dir}"
+
+    # --- Collect paths to include ---
+    local -a backup_paths=()
+
+    # Module DATA — the stuff users actually care about. Included by
+    # default (full backup). Skipped with --config-only for a fast
+    # lightweight snapshot that only covers secrets + configuration.
+    #
+    # Why full-by-default: YunoHost backs up everything. CasaOS backs
+    # up nothing. We're supposed to be "the easiest, most user-friendly
+    # self-hosting stack anywhere" — a backup command that silently
+    # skips your photos, documents, and passwords is the opposite of
+    # that. Users who've been running OpenBox for months and type
+    # `openbox backup` expect their data to be in the archive.
+    if [[ "${config_only}" == "false" ]]; then
+        while IFS= read -r path_item; do
+            [[ -n "${path_item}" ]] && backup_paths+=("${path_item}")
+        done < <(collect_backup_paths full)
+
+        local backup_file="${dest_dir}/openbox-full-${timestamp}.tar.gz"
+        log_info "Creating FULL backup (config + all module data)..."
+        log_info "This may take a while for large photo/media libraries."
+
+        # Estimate size so the user knows what to expect
+        local est_size
+        est_size=$(du -sh "${OB_ROOT}/data" "${OB_ROOT}"/modules/*/data 2>/dev/null | tail -1 | cut -f1)
+        if [[ -n "${est_size}" ]]; then
+            log_info "Estimated data size: ~${est_size} (compressed archive will be smaller)"
+        fi
+    else
+        while IFS= read -r path_item; do
+            [[ -n "${path_item}" ]] && backup_paths+=("${path_item}")
+        done < <(collect_backup_paths config-only)
+
+        local backup_file="${dest_dir}/openbox-config-${timestamp}.tar.gz"
+        log_info "Creating CONFIG-ONLY backup (secrets + module configs, no data)..."
+        log_info "Use 'openbox backup' (without --config-only) for a full backup including photos, documents, and media."
+    fi
+
+    if [[ ${#backup_paths[@]} -eq 0 ]]; then
+        log_warn "Nothing to back up."
+        exit 0
+    fi
+
+    log_info "Destination: ${dest_dir}"
+
+    # Clean up partial archive on Ctrl+C so a user who cancels
+    # mid-backup doesn't end up with a corrupt file they might
+    # later try to restore from.
+    trap 'rm -f "${backup_file}"; log_warn "Backup interrupted — partial archive removed."; exit 130' INT TERM
+
+    local tar_rc=0
+    tar -czf "${backup_file}" \
+        -C "${OB_ROOT}" \
+        --exclude='state/sessions' \
+        --exclude='state/sessions/*' \
+        --ignore-failed-read \
+        "${backup_paths[@]}" || tar_rc=$?
+
+    # tar exit 1 with --ignore-failed-read means "finished but some
+    # files were skipped" (e.g., a module's internal secrets dir at
+    # mode 0700). That's OK — the unreadable files are regenerated on
+    # container startup. Exit 2+ is fatal.
+    if [[ ${tar_rc} -ge 2 ]]; then
+        log_error "Backup failed — tar exited with code ${tar_rc}."
+        rm -f "${backup_file}"
+        exit 1
+    fi
+    if [[ ! -f "${backup_file}" ]]; then
+        log_error "Backup failed — archive was not created."
+        exit 1
+    fi
+    # Quick integrity check — can tar read its own output?
+    if ! tar -tzf "${backup_file}" >/dev/null 2>&1; then
+        log_error "Backup failed — archive is corrupt."
+        rm -f "${backup_file}"
+        exit 1
+    fi
+    local size
+    size=$(du -h "${backup_file}" | cut -f1)
+    log_ok "Backup created: ${backup_file} (${size})"
+
+    # Remind users about external storage
+    if [[ "${dest_dir}" == "${OB_BACKUP_DIR}" ]]; then
+        echo ""
+        log_warn "This backup is on the SAME DRIVE as your data."
+        log_warn "If this drive fails, the backup is lost too."
+        log_warn "Copy it to an external drive or network share:"
+        echo "  cp ${backup_file} /mnt/usb/"
+        echo "  # or use --dest next time:"
+        echo "  openbox backup --dest /mnt/usb/"
+        echo ""
+    fi
+}
+
+cmd_restore() {
+    local backup_file=""
+    local assume_yes=false
+
+    # --yes accepted in any position so scripted restores (CI, smoke
+    # tests) don't need to pipe y/n into stdin. Interactive prompt
+    # below only fires when --yes is absent.
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --yes|-y) assume_yes=true; shift ;;
+            -*) log_error "Unknown flag: $1. Usage: openbox restore [--yes] <backup-file>"; exit 1 ;;
+            *) backup_file="$1"; shift ;;
+        esac
+    done
+
+    load_env
+    restore_recover_interrupted_swap
+
+    if [[ -z "${backup_file}" ]]; then
+        log_error "Usage: openbox restore <backup-file>"
+        if [[ -d "${OB_BACKUP_DIR}" ]]; then
+            echo ""
+            echo "Available backups:"
+            find "${OB_BACKUP_DIR}" -maxdepth 1 -type f \( -name 'openbox-*.tar.gz' -o -name 'openbox-*.tar.gz.enc' \) -printf '%P\n' 2>/dev/null | while IFS= read -r candidate; do
+                backup_filename_matches "${candidate}" && ls -lh "${OB_BACKUP_DIR}/${candidate}"
+            done || echo "  No backups found."
+        fi
+        exit 1
+    fi
+
+    if [[ ! -f "${backup_file}" ]]; then
+        log_error "Backup file not found: ${backup_file}"
+        exit 1
+    fi
+    if ! backup_filename_matches "${backup_file}"; then
+        log_error "Invalid backup filename: $(basename "${backup_file}")"
+        exit 1
+    fi
+
+    # Handle encrypted backups (.tar.gz.enc)
+    local restore_file="${backup_file}"
+    local decrypted_tmp=""
+    if [[ "${backup_file}" == *.enc ]]; then
+        log_info "Encrypted backup detected — decrypting..."
+        decrypted_tmp="$(mktemp "/tmp/$(basename "${backup_file%.enc}").XXXXXX")"
+
+        local decrypt_script
+        decrypt_script=$(cat <<'NODESCRIPT'
+const crypto = require('crypto');
+const fs = require('fs');
+const secret = process.env.OB_BACKUP_KEY || process.env.OB_SESSION_SECRET;
+if (!secret) { console.error('No OB_BACKUP_KEY found in environment'); process.exit(1); }
+const key = crypto.scryptSync(secret, 'openbox-backup-salt', 32);
+const stat = fs.statSync(process.argv[1]);
+if (stat.size < 32) { console.error('Encrypted backup is truncated'); process.exit(1); }
+const fd = fs.openSync(process.argv[1], 'r');
+const iv = Buffer.alloc(16);
+const authTag = Buffer.alloc(16);
+fs.readSync(fd, iv, 0, 16, 0);
+fs.readSync(fd, authTag, 0, 16, stat.size - 16);
+fs.closeSync(fd);
+const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+decipher.setAuthTag(authTag);
+const tmp = `${process.argv[2]}.tmp.${process.pid}`;
+const input = fs.createReadStream(process.argv[1], { start: 16, end: stat.size - 17 });
+const output = fs.createWriteStream(tmp, { flags: 'wx' });
+require('stream/promises').pipeline(input, decipher, output).then(() => {
+  fs.renameSync(tmp, process.argv[2]);
+}).catch((err) => {
+  try { fs.unlinkSync(tmp); } catch {}
+  console.error(err.message || String(err));
+  process.exit(1);
+});
+NODESCRIPT
+        )
+
+        if command -v node &>/dev/null; then
+            node -e "${decrypt_script}" "${backup_file}" "${decrypted_tmp}"
+        elif docker exec ob-dashboard node -e "process.exit(0)" &>/dev/null; then
+            # Use node inside the dashboard container — mount files via docker cp
+            local container_src="/tmp/ob-restore-enc"
+            local container_dst="/tmp/ob-restore-dec"
+            docker cp "${backup_file}" "ob-dashboard:${container_src}"
+            docker exec -e OB_BACKUP_KEY="${OB_BACKUP_KEY:-}" -e OB_SESSION_SECRET="${OB_SESSION_SECRET:-}" \
+                ob-dashboard node -e "${decrypt_script}" "${container_src}" "${container_dst}"
+            docker cp "ob-dashboard:${container_dst}" "${decrypted_tmp}"
+            docker exec ob-dashboard rm -f "${container_src}" "${container_dst}" 2>/dev/null || true
+        else
+            log_error "This backup is encrypted. To restore, you need node.js or a running ob-dashboard container."
+            exit 1
+        fi
+
+        if [[ ! -f "${decrypted_tmp}" ]]; then
+            log_error "Decryption failed — output file not created."
+            exit 1
+        fi
+        log_ok "Decryption successful."
+        restore_file="${decrypted_tmp}"
+    fi
+
+    log_warn "This will overwrite current configuration!"
+    if [[ "${assume_yes}" == "true" ]]; then
+        log_info "(--yes given; skipping confirmation)"
+    else
+        read -rp "Continue? [y/N] " confirm
+        if [[ "${confirm}" != "y" && "${confirm}" != "Y" ]]; then
+            log_info "Restore cancelled."
+            exit 0
+        fi
+    fi
+
+    local restore_parent restore_base restore_ts restore_snapshot restore_rollback restore_staging restore_success=false
+    restore_parent="$(dirname "${OB_ROOT}")"
+    restore_base="$(basename "${OB_ROOT}")"
+    restore_ts="$(date +%s)"
+    restore_snapshot="${restore_parent}/${restore_base}.restore-snapshot-${restore_ts}"
+    restore_rollback="${restore_parent}/${restore_base}.restore-rollback-${restore_ts}"
+    restore_staging="${restore_parent}/${restore_base}.restore-staging-${restore_ts}"
+
+    trap '
+        if [[ "${restore_success}" != "true" ]]; then
+            restore_rollback_swap "${restore_rollback}" 2>/dev/null || true
+            run_compose_per_module down 2>/dev/null || true
+            restore_start_stack >/dev/null 2>&1 || true
+        fi
+        [[ -n "${decrypted_tmp}" && -f "${decrypted_tmp}" ]] && rm -f "${decrypted_tmp}"
+    ' EXIT
+
+    restore_snapshot_paths "${restore_snapshot}"
+    log_info "Stopping OpenBox..."
+    run_compose_per_module down 2>/dev/null || true
+
+    log_info "Restoring from backup..."
+    # Pre-scan every member of the archive and refuse path traversal
+    # (absolute paths, .. segments) BEFORE extracting. Without this a
+    # malicious backup tarball could overwrite arbitrary host files
+    # via tar's default behavior.
+    local bad_entry
+    bad_entry=$(tar -tzf "${restore_file}" 2>/dev/null | awk '
+        /^\// { print "absolute: " $0; exit }
+        /(^|\/)\.\.(\/|$)/ { print "traversal: " $0; exit }
+        /^$/ { next }
+    ')
+    if [[ -n "${bad_entry}" ]]; then
+        [[ -n "${decrypted_tmp}" && -f "${decrypted_tmp}" ]] && rm -f "${decrypted_tmp}"
+        log_error "Refusing to restore backup — unsafe archive entry: ${bad_entry}"
+        log_error "This backup is either corrupt or malicious. Aborting."
+        exit 1
+    fi
+    # Refuse unsafe entry types. tar -tvzf prints a long-listing where
+    # the first character of column 1 indicates the entry type:
+    #   - = regular file, d = directory, l = symlink, h = hardlink,
+    #   c = char device, b = block device, p = fifo, s = socket
+    #
+    # Device files (b, c), fifos (p), and sockets (s) are outright
+    # rejected — legitimate config backups never contain them, and
+    # extracting them as root could create raw disk access paths.
+    #
+    # Symlinks (l) and hardlinks (h) are ALLOWED only when the link
+    # target is relative and does not escape the archive. Real-world
+    # module data — Nextcloud's apps/*/js/*.license files alone are
+    # thousands of relative symlinks — requires symlink support.
+    # The link target comes after " -> " in tar -tvzf's output.
+    local bad_entry_type
+    bad_entry_type=$(tar -tvzf "${restore_file}" 2>/dev/null | awk '
+        {
+            ch = substr($1, 1, 1)
+            if (ch == "-" || ch == "d") next
+            if (ch == "b" || ch == "c" || ch == "p" || ch == "s") {
+                print "unsafe-type=" ch ": " $0
+                exit
+            }
+            if (ch == "l" || ch == "h") {
+                # Extract the link target: everything after " -> "
+                idx = index($0, " -> ")
+                if (idx == 0) next
+                target = substr($0, idx + 4)
+                # Reject absolute and parent-escape targets
+                if (target ~ /^\//) {
+                    print "absolute-link=" ch ": " $0
+                    exit
+                }
+                if (target ~ /(^|\/)\.\.(\/|$)/) {
+                    print "traversal-link=" ch ": " $0
+                    exit
+                }
+                next
+            }
+            # Unknown type — be conservative and reject
+            print "unknown-type=" ch ": " $0
+            exit
+        }
+    ')
+    if [[ -n "${bad_entry_type}" ]]; then
+        [[ -n "${decrypted_tmp}" && -f "${decrypted_tmp}" ]] && rm -f "${decrypted_tmp}"
+        log_error "Refusing to restore backup — unsafe archive entry: ${bad_entry_type}"
+        log_error "Device files, fifos, sockets, and links escaping the archive are not allowed."
+        exit 1
+    fi
+    restore_stage_and_swap "${restore_file}" "${restore_rollback}" "${restore_staging}"
+
+    # Clean up decrypted temp file
+    [[ -n "${decrypted_tmp}" && -f "${decrypted_tmp}" ]] && rm -f "${decrypted_tmp}"
+
+    log_ok "Restore complete. Starting OpenBox..."
+    if ! restore_start_stack; then
+        log_error "Restore applied but services failed to start. Rolling back."
+        restore_rollback_swap "${restore_rollback}" 2>/dev/null || true
+        restore_start_stack >/dev/null 2>&1 || true
+        exit 1
+    fi
+    restore_success=true
+    trap - EXIT
+    banner
+    log_ok "OpenBox is running!"
+    echo ""
+    cmd_urls
+}
+
+cmd_config() {
+    if [[ -f "${OB_ROOT}/scripts/setup.sh" ]]; then
+        bash "${OB_ROOT}/scripts/setup.sh"
+    else
+        log_error "Setup script not found. Please reinstall OpenBox."
+        exit 1
+    fi
+}
+
+# Recover from a lost dashboard admin password WITHOUT nuking data.
+#
+# Security model: this command requires sudo + shell access to the
+# OpenBox host, and nothing else. That's the same trust anchor as the
+# initial install (you're the one who owns the box), so it's safe to
+# expose as a self-serve recovery path instead of forcing users to
+# full-wipe and re-migrate their modules. It deliberately has no
+# network-reachable equivalent — anyone on your LAN hitting the
+# dashboard should never be able to reset your password without going
+# through a shell.
+#
+# What it does, in order:
+#   1. Prompt for a new password (twice, hidden) or read from $1 for
+#      automation.
+#   2. Enforce a minimum length of 8 characters.
+#   3. Hash with bcrypt via scripts/setup.sh's hash_password helper,
+#      which prefers node's bcryptjs (same library the dashboard uses
+#      to verify), falls back to python3 bcrypt, or SHA-256 if neither
+#      is present. The dashboard will upgrade SHA-256 hashes to bcrypt
+#      on first successful login.
+#   4. Rewrite .env in place, replacing the existing
+#      OB_ADMIN_PASSWORD_HASH= line (or appending one if missing).
+#      Uses a temp file + mv so a partial write can't corrupt .env.
+#   5. Restart ob-dashboard so loadEnvFromDisk picks up the new hash.
+#      Without this, the running Node process still holds the old
+#      hash in process.env and rejects the new password until the
+#      container is recreated or rebooted.
+cmd_reset_password() {
+    if [[ $EUID -ne 0 ]]; then
+        log_error "reset-password requires root (sudo openbox reset-password)."
+        exit 1
+    fi
+    if [[ ! -f "${OB_ROOT}/.env" ]]; then
+        log_error "No .env found at ${OB_ROOT}/.env. Is OpenBox installed?"
+        exit 1
+    fi
+
+    # Accept the new password via stdin (--stdin flag) or via an
+    # interactive TTY prompt. Never as a positional argument — that
+    # would leak to shell history, ps output, and sudo's audit log,
+    # defeating the whole point of a safer recovery path.
+    local new_pw new_pw2 from_stdin=false
+    if [[ "${1:-}" == "--stdin" ]]; then
+        from_stdin=true
+    elif [[ -n "${1:-}" ]]; then
+        log_error "reset-password does not accept the new password as a command-line argument."
+        log_error "  It would leak to shell history, ps output, and sudo audit logs."
+        log_error "  Run it interactively:  sudo openbox reset-password"
+        log_error "  Or pipe from stdin:    echo 'newpass' | sudo openbox reset-password --stdin"
+        exit 1
+    fi
+
+    if [[ "${from_stdin}" == "true" ]]; then
+        IFS= read -r new_pw
+    elif [[ -t 0 ]]; then
+        echo "Enter new dashboard admin password (8+ characters):"
+        read -r -s new_pw
+        echo ""
+        echo "Enter the same password again:"
+        read -r -s new_pw2
+        echo ""
+        if [[ "${new_pw}" != "${new_pw2}" ]]; then
+            log_error "Passwords did not match."
+            exit 1
+        fi
+    else
+        log_error "No TTY and no --stdin flag — refusing to prompt blindly. Run interactively or pass --stdin."
+        exit 1
+    fi
+
+    if [[ ${#new_pw} -lt 8 ]]; then
+        log_error "Password must be at least 8 characters."
+        exit 1
+    fi
+
+    # Hash the password. Inline rather than sourcing scripts/setup.sh
+    # because setup.sh runs an interactive install wizard at top level
+    # and can't be safely sourced as a library. Try bcrypt via the
+    # dashboard's bcryptjs (same library the login route verifies
+    # against), then python3 bcrypt, then htpasswd. Each candidate is
+    # wrapped in || true so a missing binary exits the command
+    # substitution cleanly under set -euo pipefail instead of aborting
+    # the whole CLI.
+    #
+    # We do NOT fall back to SHA-256. The dashboard's login route
+    # only verifies bcrypt-shaped hashes; a SHA-256 fallback would
+    # leave the user unable to log in and the CLI would succeed
+    # silently. Fail loud instead.
+    local new_hash=""
+    # All hasher invocations below feed the plaintext via stdin, never
+    # via argv (-e KEY=VAL or positional args). /proc/<pid>/cmdline is
+    # world-readable by default, so an unprivileged local user could
+    # otherwise scrape the new password from `ps` for the lifetime of
+    # the hasher process. stdin pipes are private to the process pair.
+
+    # Preferred path: hash inside the running ob-dashboard container, which
+    # always has node + bcryptjs baked into the image. Works on UGOS and any
+    # NAS where the host has neither node nor python-bcrypt installed (the
+    # common case — the dashboard image's node_modules is intentionally NOT
+    # bind-mounted, so the host can't see bcryptjs even when the install
+    # dir is correct).
+    if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ob-dashboard$'; then
+        new_hash=$(printf '%s' "${new_pw}" | \
+            docker exec -i ob-dashboard \
+            node -e "let p='';process.stdin.on('data',d=>p+=d).on('end',()=>console.log(require('bcryptjs').hashSync(p,12)))" 2>/dev/null || true)
+    fi
+    # Fallback: host-side node with the install dir's bundled bcryptjs.
+    if [[ -z "${new_hash}" ]] && command -v node >/dev/null 2>&1 && [[ -f "${OB_ROOT}/dashboard/node_modules/bcryptjs/index.js" ]]; then
+        new_hash=$(printf '%s' "${new_pw}" | OB_BCRYPT_PATH="${OB_ROOT}/dashboard/node_modules/bcryptjs" \
+            node -e "const b=require(process.env.OB_BCRYPT_PATH);let p='';process.stdin.on('data',d=>p+=d).on('end',()=>console.log(b.hashSync(p,12)))" 2>/dev/null || true)
+    fi
+    # Last-resort fallbacks for hosts without docker (rare).
+    if [[ -z "${new_hash}" ]] && python3 -c "import bcrypt" >/dev/null 2>&1; then
+        new_hash=$(printf '%s' "${new_pw}" | \
+            python3 -c "import sys,bcrypt;p=sys.stdin.read();print(bcrypt.hashpw(p.encode(),bcrypt.gensalt(12)).decode())" 2>/dev/null || true)
+    fi
+    if [[ -z "${new_hash}" ]] && command -v htpasswd >/dev/null 2>&1; then
+        # htpasswd -i reads password from stdin instead of argv.
+        new_hash=$(printf '%s' "${new_pw}" | htpasswd -niBC 12 "" 2>/dev/null | cut -d: -f2 || true)
+    fi
+    if [[ -z "${new_hash}" ]]; then
+        log_error "Could not hash password — ob-dashboard container is not running and no fallback hasher (node/bcryptjs, python3/bcrypt, htpasswd) is available."
+        log_error "  Start the dashboard first:  sudo ${OB_ROOT}/openbox up"
+        log_error "  Then re-run reset-password:  sudo ${OB_ROOT}/openbox reset-password"
+        exit 1
+    fi
+
+    # Atomic rewrite of .env. Preserve everything else, replace only
+    # OB_ADMIN_PASSWORD_HASH. The compose escape rule (bcrypt $ → $$)
+    # is applied via config's escapeEnvValue convention: any literal $
+    # in the hash becomes $$ so docker-compose doesn't interpret it.
+    local escaped_hash
+    escaped_hash=${new_hash//\$/\$\$}
+    local tmp
+    tmp=$(mktemp "${OB_ROOT}/.env.pwreset.XXXXXX")
+    if grep -q '^OB_ADMIN_PASSWORD_HASH=' "${OB_ROOT}/.env"; then
+        # sed substitution: use | as delimiter to avoid collisions
+        # with / in bcrypt hashes, and escape & which sed treats as
+        # "insert match here" in replacement strings.
+        local sed_safe=${escaped_hash//\&/\\&}
+        sed "s|^OB_ADMIN_PASSWORD_HASH=.*|OB_ADMIN_PASSWORD_HASH=${sed_safe}|" "${OB_ROOT}/.env" > "${tmp}"
+    else
+        cp "${OB_ROOT}/.env" "${tmp}"
+        printf '\nSB_ADMIN_PASSWORD_HASH=%s\n' "${escaped_hash}" >> "${tmp}"
+    fi
+    # Preserve the original ownership so the dashboard container
+    # (running as uid 1000) can still read .env after the rewrite.
+    chown --reference="${OB_ROOT}/.env" "${tmp}"
+    chmod --reference="${OB_ROOT}/.env" "${tmp}"
+    mv "${tmp}" "${OB_ROOT}/.env"
+    log_ok "Admin password hash updated in ${OB_ROOT}/.env"
+
+    # Restart the dashboard so loadEnvFromDisk picks up the new hash.
+    # Without this the running Node process still holds the old hash
+    # in process.env and the user can't log in with the new password
+    # until next reboot or container recreate.
+    if docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ob-dashboard$'; then
+        docker restart ob-dashboard >/dev/null 2>&1 && \
+            log_ok "ob-dashboard restarted — log in with your new password at http://<your-ip>:8443" || \
+            log_warn "Could not restart ob-dashboard. Run 'sudo docker restart ob-dashboard' manually."
+    else
+        log_warn "ob-dashboard not running — start it with 'sudo openbox up' and then log in with the new password."
+    fi
+}
+
+cmd_urls() {
+    load_env
+    echo -e "${BOLD}Service URLs:${NC}"
+    echo ""
+
+    local domain="${OB_DOMAIN:-localhost}"
+
+    for module in $(get_enabled_modules); do
+        local compose_file="${OB_MODULES_DIR}/${module}/docker-compose.yml"
+        [[ -f "${compose_file}" ]] || continue
+
+        local title
+        title=$(read_openbox_field "${module}" "title")
+        [[ -z "${title}" ]] && title="${module}"
+
+        local ports_output=""
+        while IFS= read -r line; do
+            local container port svc_name
+            container=$(echo "${line}" | awk '{print $1}')
+            port=$(echo "${line}" | awk '{print $2}')
+            svc_name=$(echo "${line}" | awk '{for(i=3;i<=NF;i++) printf "%s ", $i; print ""}' | sed 's/ *$//')
+
+            [[ -z "${port}" || "${port}" == "null" ]] && continue
+            ports_output="${ports_output}    ${svc_name:-${container}}: http://${domain}:${port}\n"
+        done < <(
+            sed -n '/^x-openbox:/,/^[a-z]/p' "${compose_file}" | \
+            sed -n '/^  services:/,/^  [a-z]/p' | \
+            awk '
+                /^    [a-z]/ { svc=$1; sub(/:$/,"",svc) }
+                /port_map:/ && !/null/ { port=$2; }
+                /friendly_name:/ { gsub(/"/,"",$0); fname=""; for(i=2;i<=NF;i++) fname=fname (i>2?" ":"") $i }
+                /port_map:/ && !/null/ { print "sb-" svc " " port " " fname; fname="" }
+            '
+        )
+
+        if [[ -n "${ports_output}" ]]; then
+            echo -e "  ${BOLD}${title}:${NC}"
+            echo -e "${ports_output}"
+        fi
+    done
+}
+
+cmd_install() {
+    if [[ -f "${OB_ROOT}/scripts/setup.sh" ]]; then
+        banner
+        bash "${OB_ROOT}/scripts/setup.sh"
+    else
+        log_error "Setup script not found."
+        exit 1
+    fi
+}
+
+# --- Repair Portainer (v1.6.99) ---
+#
+# User-invokable hammer for the class-level Portainer admin-login bug
+# (openboxfan #8799, GamerX06 #9622, LaggyGamerZA #9024 — all on
+# 2026-05-{09,12}). Symptom: fresh install, generated password from
+# state/portainer-admin-password.txt produces HTTP 422 on POST /api/auth.
+# Root cause is suspected to be a first-boot race where Portainer's bolt
+# DB initialized with a different admin hash than the file we passed via
+# --admin-password-file. Once Portainer has any admin user, subsequent
+# changes to the hash file are ignored.
+#
+# This command does the unconditional fix: stop the container, wipe its
+# /data volume, regenerate the bcrypt hash, restart. Always works because
+# we're recreating Portainer's DB from scratch. Reuses the bcrypt fallback
+# chain from cmd_up's existing self-heal block (htpasswd → python3-bcrypt
+# → docker httpd:alpine).
+cmd_repair_portainer() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        log_error "openbox repair-portainer must be run as root."
+        echo "Try: sudo ${0} repair-portainer"
+        exit 1
+    fi
+
+    banner
+    echo -e "${BOLD}Repair Portainer${NC}"
+    echo "Wiping Portainer admin state and regenerating credentials from scratch."
+    echo "Anything you'd configured inside Portainer (custom dashboards, env"
+    echo "groups, etc.) will be lost — most users have nothing in there because"
+    echo "they couldn't log in to begin with."
+    echo ""
+
+    local _portainer_secret="${OB_ROOT}/modules/core/config/portainer-admin-password"
+    local _portainer_data="${OB_ROOT}/modules/core/config/portainer"
+    local _ppw_file="${OB_ROOT}/state/portainer-admin-password.txt"
+
+    # Step 1 — stop the container so the password file is read fresh on
+    # restart (Portainer only honors --admin-password-file when no admin
+    # user exists yet in /data/portainer.db).
+    log_info "Stopping ob-portainer..."
+    docker rm -f ob-portainer >/dev/null 2>&1 || true
+
+    # Step 2 — wipe Portainer's /data volume to clear any stale admin.
+    log_info "Wiping ${_portainer_data}..."
+    rm -rf "${_portainer_data}" 2>/dev/null || true
+    mkdir -p "${_portainer_data}"
+
+    # Step 3 — generate a fresh password.
+    local _ppw=""
+    _ppw=$(openssl rand -base64 24 2>/dev/null | tr -d '/+=' | head -c 16)
+    if [[ -z "${_ppw}" ]]; then
+        log_error "openssl rand failed — cannot generate password. Install openssl and retry."
+        exit 1
+    fi
+
+    # Step 4 — write the PLAINTEXT password to the bind-mounted secret file
+    # (compose reads it as --admin-password-file) and to the state-dir
+    # plaintext file (the dashboard surfaces this to the user via
+    # STATE_FILE_CREDS).
+    #
+    # v1.6.101: Portainer 2.41 changed --admin-password-file semantics from
+    # "contains bcrypt hash" to "contains plaintext" — Portainer hashes
+    # internally before storing in its bolt DB. Confirmed in the wild
+    # 2026-05-12 by LaggyGamerZA #9024 after a 3-report class-level
+    # diagnostic: bcrypt verify locally returned True, Portainer's docker
+    # log said "created admin user with the given password", POST /api/auth
+    # still returned 422. Swapping bcrypt hash for plaintext in the file
+    # made login work immediately. Sibling reports closed: openboxfan
+    # #8799, GamerX06 #9622. The old bcrypt fallback chain (htpasswd →
+    # python3-bcrypt → docker httpd:alpine) is removed — no longer needed.
+    mkdir -p "$(dirname "${_portainer_secret}")"
+    printf '%s' "${_ppw}" > "${_portainer_secret}"
+    chmod 600 "${_portainer_secret}"
+    mkdir -p "${OB_ROOT}/state"
+    printf 'username: admin\npassword: %s\n' "${_ppw}" > "${_ppw_file}"
+    chmod 600 "${_ppw_file}"
+    log_ok "New admin password written to ${_ppw_file}"
+
+    # Step 5 — start ob-portainer fresh. It'll read --admin-password-file
+    # on first boot (now that there's no admin in /data) and set the hash
+    # as the admin user.
+    log_info "Starting ob-portainer with new credentials..."
+    local _core_compose="${OB_ROOT}/modules/core/docker-compose.yml"
+    if [[ -f "${_core_compose}" ]]; then
+        if ! docker compose -p openbox -f "${_core_compose}" up -d portainer >/dev/null 2>&1; then
+            log_error "docker compose up failed — Portainer not restarted. Run: sudo openbox up"
+            exit 1
+        fi
+    else
+        log_error "Core compose file not found at ${_core_compose}"
+        exit 1
+    fi
+
+    # Step 6 — verify the new credentials actually work by attempting an
+    # auth POST. Wait up to ~20s for Portainer to come up and respond.
+    local _portainer_port
+    # v1.6.103: trailing `|| true` — under `set -euo pipefail`, a grep
+    # with no matches makes the pipe return 1, which propagates through
+    # command-substitution and silently kills the script on assignment.
+    # PORTAINER_PORT is currently always in .env (install.sh writes it
+    # at line ~1649), so this never bit repair-portainer in the wild,
+    # but the SAME bug DID bite repair-seerr 30 min after v1.6.102
+    # shipped — SEERR_PORT isn't in .env, so the equivalent line
+    # silently killed repair-seerr right after "Starting ob-seerr fresh"
+    # (caught by LaggyGamerZA #9024). Hardening symmetrically so a
+    # future install.sh refactor that drops PORTAINER_PORT can't
+    # regress this.
+    _portainer_port=$(grep '^PORTAINER_PORT=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)
+    _portainer_port="${_portainer_port:-9000}"
+
+    local _verified=0
+    local _auth_code=""
+    local _esc=${_ppw//\\/\\\\}
+    _esc=${_esc//\"/\\\"}
+    local _body="{\"username\":\"admin\",\"password\":\"${_esc}\"}"
+    log_info "Verifying admin login against http://127.0.0.1:${_portainer_port}/api/auth..."
+    local _attempts=0
+    while (( _attempts < 10 )); do
+        _auth_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+            -H 'Content-Type: application/json' \
+            -X POST "http://127.0.0.1:${_portainer_port}/api/auth" \
+            -d "${_body}" 2>/dev/null || echo "000")
+        if [[ "${_auth_code}" == "200" ]]; then
+            _verified=1
+            break
+        fi
+        sleep 2
+        # v1.6.100: use assignment, not `((_attempts++))`. Post-increment
+        # returns the OLD value (0 on first iteration), which is exit code 1
+        # under `set -e` — silently killing the script after the very first
+        # verify attempt. Caught 2026-05-12 from LaggyGamerZA #9024 pasting
+        # the full output: it ended at "Verifying admin login..." with no
+        # subsequent line, because the script crashed there. The actual
+        # repair (wipe + regen + restart) had already succeeded by that
+        # point — only the verify-and-report stage was skipped.
+        _attempts=$((_attempts + 1))
+    done
+
+    echo ""
+    if (( _verified == 1 )); then
+        log_ok "Portainer admin login verified (HTTP 200)."
+        echo ""
+        echo -e "${BOLD}Done.${NC} Log in at http://<your-NAS-IP>:${_portainer_port}"
+        echo "  Username: admin"
+        echo "  Password: stored in ${_ppw_file}"
+    else
+        log_error "Portainer is up but login still failed (last HTTP: ${_auth_code:-000})."
+        echo "This shouldn't happen after a clean wipe — check 'docker logs ob-portainer'"
+        echo "and report back at https://demox.world/d/openbox with the log output."
+        exit 1
+    fi
+}
+
+cmd_repair_seerr() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        log_error "openbox repair-seerr must be run as root."
+        echo "Try: sudo ${0} repair-seerr"
+        exit 1
+    fi
+
+    banner
+    echo -e "${BOLD}Repair Seerr${NC}"
+    echo "Wiping Seerr config + restarting with correct ownership so the"
+    echo "container can write its logs/ subfolder. Recovery for the boot-loop"
+    echo "where Seerr crashes with EACCES on /app/config/logs/ after a manual"
+    echo "config wipe (root recreates the dir; Seerr inside runs as PUID 1000)."
+    echo "Any partial first-run setup will be lost; you'll get a fresh wizard."
+    echo ""
+
+    local _seerr_config="${OB_ROOT}/modules/media/config/seerr"
+    local _media_compose="${OB_ROOT}/modules/media/docker-compose.yml"
+
+    local _puid _pgid
+    _puid=$(grep -E '^PUID=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)
+    _pgid=$(grep -E '^PGID=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2)
+    _puid="${_puid:-1000}"
+    _pgid="${_pgid:-1000}"
+
+    log_info "Stopping ob-seerr..."
+    docker rm -f ob-seerr >/dev/null 2>&1 || true
+
+    log_info "Wiping ${_seerr_config}..."
+    rm -rf "${_seerr_config}" 2>/dev/null || true
+    mkdir -p "${_seerr_config}"
+
+    # The bug this command exists to fix: Seerr inside the container runs
+    # as PUID:PGID (default 1000:1000) and immediately tries to mkdir
+    # /app/config/logs/ via file-stream-rotator. If the bind-mounted host
+    # dir is owned by root (which it is after a sudo mkdir or sudo rm -rf
+    # recovery), the mkdir fails with EACCES and Seerr boot-loops.
+    # Caught 2026-05-12 #9024 LaggyGamerZA after we told him to reset.
+    log_info "Setting ownership to ${_puid}:${_pgid}..."
+    chown -R "${_puid}:${_pgid}" "${_seerr_config}"
+
+    log_info "Starting ob-seerr fresh..."
+    if [[ -f "${_media_compose}" ]]; then
+        if ! docker compose -p openbox -f "${_media_compose}" up -d seerr >/dev/null 2>&1; then
+            log_error "docker compose up failed — Seerr not restarted. Run: sudo openbox up"
+            exit 1
+        fi
+    else
+        log_error "Media compose file not found at ${_media_compose}"
+        exit 1
+    fi
+
+    local _seerr_port
+    # v1.6.103: trailing `|| true`. SEERR_PORT is not written to .env by
+    # install.sh (5055 is hardcoded into compose); grep returns 1, and
+    # under `set -euo pipefail` the command-substitution propagates that
+    # 1 to the assignment which kills the script silently. Caught
+    # 2026-05-12 from LaggyGamerZA #9024 — repair-seerr printed up to
+    # "Starting ob-seerr fresh..." and then dumped him back at the
+    # prompt with no Waiting/verify lines. The repair actually succeeded
+    # (wipe + chown + compose up all ran); only the verify-and-report
+    # phase got skipped. Same silent-crash class as v1.6.100's
+    # `((_attempts++))` fix, different trigger.
+    _seerr_port=$(grep '^SEERR_PORT=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)
+    _seerr_port="${_seerr_port:-5055}"
+
+    log_info "Waiting for Seerr to come up at http://127.0.0.1:${_seerr_port}/api/v1/status..."
+    local _verified=0
+    local _status_code=""
+    local _attempts=0
+    while (( _attempts < 30 )); do
+        _status_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+            "http://127.0.0.1:${_seerr_port}/api/v1/status" 2>/dev/null || echo "000")
+        if [[ "${_status_code}" == "200" ]]; then
+            _verified=1
+            break
+        fi
+        sleep 2
+        _attempts=$((_attempts + 1))
+    done
+
+    echo ""
+    if (( _verified == 1 )); then
+        log_ok "Seerr is up and responding (HTTP 200)."
+        echo ""
+        echo -e "${BOLD}Done.${NC} Open Seerr from your dashboard or http://<your-NAS-IP>:${_seerr_port}"
+        echo "You'll land on the first-run wizard. Sign in with your Jellyfin"
+        echo "credentials when prompted."
+    else
+        log_error "Seerr started but didn't answer /api/v1/status (last HTTP: ${_status_code:-000})."
+        echo "Check 'docker logs ob-seerr' for the error and report back at"
+        echo "https://demox.world/d/openbox with the log output."
+        exit 1
+    fi
+}
+
+# --- Doctor Command ---
+
+cmd_doctor() {
+    banner
+    echo -e "${BOLD}OpenBox Doctor${NC}"
+    echo -e "Running diagnostics..."
+    echo ""
+
+    local issues=0
+
+    # --- Docker Access ---
+    echo -e "${BOLD}[Docker]${NC}"
+    if docker info &>/dev/null 2>&1; then
+        log_ok "Docker daemon is accessible"
+        log_ok "Docker version: $(docker --version 2>/dev/null | head -1)"
+        if docker compose version &>/dev/null 2>&1; then
+            log_ok "Docker Compose: $(docker compose version --short 2>/dev/null)"
+        else
+            log_error "Docker Compose v2 not found"
+            ((issues++))
+        fi
+    else
+        log_error "Cannot connect to Docker daemon"
+        echo "  - Is Docker running?"
+        echo "  - Is your user in the docker group? Run: sudo usermod -aG docker \$(whoami)"
+        ((issues++))
+    fi
+    echo ""
+
+    # --- Docker Socket ---
+    echo -e "${BOLD}[Docker Socket]${NC}"
+    if [[ -S /var/run/docker.sock ]]; then
+        log_ok "Docker socket exists at /var/run/docker.sock"
+        if [[ -r /var/run/docker.sock ]]; then
+            log_ok "Docker socket is readable"
+        else
+            log_warn "Docker socket is not readable by current user"
+            ((issues++))
+        fi
+    else
+        log_warn "Docker socket not found at /var/run/docker.sock"
+        ((issues++))
+    fi
+    echo ""
+
+    # --- PUID/PGID Check ---
+    echo -e "${BOLD}[User IDs]${NC}"
+    local current_uid current_gid
+    current_uid=$(id -u)
+    current_gid=$(id -g)
+    log_info "Current user: $(whoami) (UID=${current_uid}, GID=${current_gid})"
+
+    if [[ -f "${OB_ENV_FILE}" ]]; then
+        local env_puid env_pgid
+        env_puid=$(grep '^PUID=' "${OB_ENV_FILE}" 2>/dev/null | cut -d= -f2 || echo "")
+        env_pgid=$(grep '^PGID=' "${OB_ENV_FILE}" 2>/dev/null | cut -d= -f2 || echo "")
+
+        # v1.6.77: comparison axis fixed. PUID/PGID in .env are the IDs
+        # the *containers* use (the dashboard image's `node` user is UID
+        # 1000), NOT a value that should match the host user running
+        # doctor. Most installs run as root (UID 0) and want PUID=1000
+        # for containers — that's the correct config, not a problem.
+        # The real misconfig is PUID=0, which broke #8929 (notrike) for
+        # half a day before v1.6.76's install.sh floor caught it.
+        if [[ -n "${env_puid}" ]]; then
+            if [[ "${env_puid}" -lt 1 ]]; then
+                log_warn "PUID=${env_puid} in .env — containers will run as root (UID 0)"
+                echo "  Most OpenBox containers expect a non-root PUID (typically 1000) and"
+                echo "  fail to write to bind mounts when forced to UID 0. Fix:"
+                echo "    sudo sed -i 's/^PUID=.*/PUID=1000/; s/^PGID=.*/PGID=1000/' ${OB_ENV_FILE}"
+                echo "    sudo chown -R 1000:1000 ${OB_ROOT}/state ${OB_ROOT}/data"
+                echo "    sudo docker rm -f ob-dashboard && sudo ${0} up"
+                ((issues++))
+            else
+                log_ok "PUID=${env_puid} (containers run as UID ${env_puid})"
+            fi
+        else
+            log_warn "PUID not set in .env"
+        fi
+
+        if [[ -n "${env_pgid}" ]]; then
+            if [[ "${env_pgid}" -lt 1 ]]; then
+                log_warn "PGID=${env_pgid} in .env — see PUID note above"
+                ((issues++))
+            else
+                log_ok "PGID=${env_pgid} (containers run as GID ${env_pgid})"
+            fi
+        else
+            log_warn "PGID not set in .env"
+        fi
+    else
+        log_warn ".env file not found -- run 'openbox install' first"
+    fi
+    echo ""
+
+    # --- Container Egress (network from inside Docker) ---
+    # Caught 2026-04-27: first paid customer's box couldn't activate
+    # license because his Docker bridge couldn't reach the internet
+    # (UFW DEFAULT_FORWARD_POLICY=DROP wasn't auto-fixed by install.sh).
+    # Symptom is "Remote validation failed:" at activation; test catches
+    # it 60s before the customer feels it.
+    echo -e "${BOLD}[Container Egress]${NC}"
+    if docker info &>/dev/null 2>&1; then
+        local egress_ok=0
+        # 2026-05-11 (v1.6.89): dropped -f to match install.sh's egress fix.
+        # webhook.crushcodeworks.com returns 404 to a bare GET (Worker only
+        # serves POST), so curl -f flagged reachable hosts as failures.
+        #
+        # 2026-05-12 (v1.6.98): bumped timeout 12→60 + curl -m 8→30 + added
+        # explicit pre-pull. Same root cause as install.sh's egress fix at
+        # v1.6.98: cold systems without `curlimages/curl` cached were
+        # timing out on docker run before curl ever fired.
+        docker pull -q curlimages/curl:latest >/dev/null 2>&1 || true
+        if timeout 60 docker run --rm --network bridge curlimages/curl:latest \
+                -sS -o /dev/null -m 30 https://webhook.crushcodeworks.com 2>/dev/null; then
+            egress_ok=1
+        fi
+        if [[ "${egress_ok}" == "1" ]]; then
+            log_ok "Containers can reach webhook.crushcodeworks.com (license server)"
+        else
+            # v1.6.70: soften wording to match install.sh's v1.6.68 fix.
+            # OpenBox is FREE since v1.6.3; license activation is an
+            # OPTIONAL Pro-tier feature. The old log_error + "license
+            # activation will fail" copy was triggering the same
+            # confusion install.sh did in #8800/#8461 (notrike on #8929
+            # confirmed it's still scary in doctor). Drop the issue
+            # counter bump for the same reason — this isn't an issue
+            # on a free install.
+            log_warn "Container egress check failed — ob_proxy cannot reach webhook.crushcodeworks.com."
+            echo "  This is fine if you only need free OpenBox. Optional Pro-tier license"
+            echo "  activation won't work until egress is restored, but every bundled app"
+            echo "  (Jellyfin, Pi-hole, Vaultwarden, etc.) runs the same either way."
+            echo "  If you DO want to fix it (Pro tier only):"
+            echo "    1. UFW: grep DEFAULT_FORWARD_POLICY /etc/default/ufw  (should be ACCEPT)"
+            echo "    2. Run: sudo openbox repair-network"
+            echo "    3. If you have a custom /etc/docker/daemon.json, check its DNS settings."
+            echo "  Re-run 'openbox doctor' to verify."
+        fi
+    else
+        log_warn "Docker unreachable — skipping egress test (fix Docker first)"
+    fi
+    echo ""
+
+    # --- Port Conflicts ---
+    echo -e "${BOLD}[Port Conflicts]${NC}"
+    local check_ports=(53 80 443 8080 8443 9000)
+    for port in "${check_ports[@]}"; do
+        local pid_info
+        pid_info=$(ss -tlnp 2>/dev/null | grep ":${port} " | head -1 || true)
+        if [[ -n "${pid_info}" ]]; then
+            # Check if it's a OpenBox container
+            if echo "${pid_info}" | grep -q "docker\|containerd"; then
+                log_ok "Port ${port}: in use (Docker -- likely OpenBox)"
+            else
+                log_warn "Port ${port}: in use by non-Docker process"
+                echo "  ${pid_info}"
+                ((issues++))
+            fi
+        else
+            log_ok "Port ${port}: available"
+        fi
+    done
+    echo ""
+
+    # --- Portainer Auth (v1.6.99) ---
+    # Caught 2026-05-12 as a 3-report class-level bug (openboxfan #8799,
+    # GamerX06 #9622, LaggyGamerZA #9024): fresh install completes, the
+    # bcrypt file in modules/core/config/portainer-admin-password is valid
+    # ($2[aby]$ prefix, non-empty), state/portainer-admin-password.txt has
+    # the matching plaintext — yet POST /api/auth returns 422. Likely a
+    # first-boot race where Portainer's bolt DB landed an admin hash that
+    # doesn't match the file. cmd_up's self-heal block can't catch this
+    # because the file *looks* valid; only an actual login attempt against
+    # the running container reveals it.
+    echo -e "${BOLD}[Portainer Auth]${NC}"
+    local _ppw_file="${OB_ROOT}/state/portainer-admin-password.txt"
+    local _portainer_port
+    # v1.6.103: trailing `|| true` — see cmd_repair_portainer for context.
+    _portainer_port=$(grep '^PORTAINER_PORT=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2 || true)
+    _portainer_port="${_portainer_port:-9000}"
+    if ! docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^ob-portainer$'; then
+        log_info "ob-portainer not running — skipping (run: sudo openbox up)"
+    elif [[ ! -f "${_ppw_file}" ]]; then
+        log_warn "No admin password file at ${_ppw_file} — cannot verify login"
+        echo "  Run: sudo openbox repair-portainer  to (re)generate one."
+    else
+        local _ppw _auth_code
+        _ppw=$(awk -F': ' '/^password:/ {print $2; exit}' "${_ppw_file}" 2>/dev/null)
+        if [[ -z "${_ppw}" ]]; then
+            log_warn "Could not parse password from ${_ppw_file} — check file format"
+        else
+            local _esc=${_ppw//\\/\\\\}
+            _esc=${_esc//\"/\\\"}
+            local _body="{\"username\":\"admin\",\"password\":\"${_esc}\"}"
+            _auth_code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+                -H 'Content-Type: application/json' \
+                -X POST "http://127.0.0.1:${_portainer_port}/api/auth" \
+                -d "${_body}" 2>/dev/null || echo "000")
+            if [[ "${_auth_code}" == "200" ]]; then
+                log_ok "Portainer admin login verified (HTTP 200)"
+            elif [[ "${_auth_code}" == "422" ]] || [[ "${_auth_code}" == "401" ]]; then
+                log_error "Portainer admin login FAILED (HTTP ${_auth_code}) — known class-level bug"
+                echo "  Fix:  sudo openbox repair-portainer"
+                echo "  Then log in at http://<your-NAS-IP>:${_portainer_port} with the new password"
+                echo "  (saved to state/portainer-admin-password.txt)."
+                ((issues++))
+            elif [[ "${_auth_code}" == "000" ]]; then
+                log_warn "Portainer not responding at http://127.0.0.1:${_portainer_port} — may still be starting"
+            else
+                log_warn "Portainer returned HTTP ${_auth_code} (unexpected — try again in 30s or check 'docker logs ob-portainer')"
+            fi
+        fi
+    fi
+    echo ""
+
+    # --- VPN Tunnel (v1.6.104) ---
+    # Caught 2026-05-12 as a class-level pattern across 2 reports in one night
+    # (jackhammer57 #9863, GamerX06 #9984): install.sh's interactive prompt
+    # collects VPN_PROVIDER / WIREGUARD_PRIVATE_KEY / WIREGUARD_ADDRESSES /
+    # optionally SERVER_CITIES, install completes "successfully", then gluetun
+    # crashes or hangs on bad creds (wrong key form, PublicKey pasted as
+    # PrivateKey, SERVER_CITIES not in provider's gluetun-known list, etc.) —
+    # and the user has no signal that anything is wrong until they look at
+    # `docker logs ob-gluetun`, which beta testers don't think to do. This
+    # probe surfaces gluetun's health + the actual error line so doctor
+    # becomes the one-command answer to "my media stack didn't come up."
+    echo -e "${BOLD}[VPN Tunnel]${NC}"
+    # v1.6.105: /dev/net/tun preflight. Caught 2026-05-13 by GamerX06 #9984
+    # — his ob-gluetun container was stuck in `Created` state with ZERO log
+    # output. Root cause was a host missing the `tun` kernel module, which
+    # surfaces in `docker compose up` as `error gathering device information
+    # while adding custom device "/dev/net/tun": no such file or directory`
+    # but is invisible from `docker logs ob-gluetun` (container never ran)
+    # and from the dashboard. v1.6.104's probe correctly flagged unhealthy
+    # but had no error lines to surface and the "common fixes" hint was
+    # misleading because creds weren't the problem. Check tun first.
+    if [[ ! -c /dev/net/tun ]]; then
+        log_error "/dev/net/tun is missing — gluetun cannot create a VPN interface"
+        echo "  Your host's tun kernel module isn't loaded. Fix:"
+        echo "    sudo modprobe tun"
+        echo "    echo tun | sudo tee -a /etc/modules    # persists across reboots"
+        echo "    sudo openbox restart media"
+        ((issues++))
+        echo ""
+    elif ! docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q '^ob-gluetun$'; then
+        log_info "ob-gluetun not deployed — media stack not installed (or VPN module skipped)"
+    else
+        local _gluetun_health
+        _gluetun_health=$(docker inspect ob-gluetun --format '{{.State.Health.Status}}' 2>/dev/null || echo "unknown")
+        # v1.6.105: also surface container State.Status — a `Created`-but-
+        # never-started container has no health status and no logs, so the
+        # health-only branch would fall through to "no error lines" without
+        # explaining why. GamerX06 #9984 hit this.
+        local _gluetun_state
+        _gluetun_state=$(docker inspect ob-gluetun --format '{{.State.Status}}' 2>/dev/null || echo "unknown")
+        if [[ "${_gluetun_health}" == "healthy" ]]; then
+            log_ok "Gluetun tunnel is healthy"
+        elif [[ "${_gluetun_health}" == "starting" ]]; then
+            log_warn "Gluetun is still starting — re-run doctor in 30s if media stack hasn't come up"
+        elif [[ "${_gluetun_state}" == "created" ]] || [[ "${_gluetun_state}" == "exited" ]]; then
+            log_error "Gluetun container is ${_gluetun_state} — it never actually ran"
+            ((issues++))
+            echo "  Most likely: docker compose couldn't bring it up (missing kernel module,"
+            echo "  bind-mount permission, or compose-syntax issue). Try:"
+            echo "    sudo openbox restart media   2>&1 | tail -5"
+            echo "  and look for an 'Error response from daemon:' line — that's the actual cause."
+        else
+            log_error "Gluetun is ${_gluetun_health} — VPN tunnel is not established"
+            ((issues++))
+            # Surface the actual rejection from gluetun's logs so users know
+            # what to fix in .env instead of having to know to run
+            # `docker logs ob-gluetun` themselves.
+            local _gluetun_err
+            _gluetun_err=$(docker logs ob-gluetun --tail 30 2>&1 | grep -E 'ERROR|FATAL' | tail -5 || true)
+            if [[ -n "${_gluetun_err}" ]]; then
+                echo "  Last error(s) from gluetun:"
+                while IFS= read -r line; do
+                    echo "    ${line}"
+                done <<< "${_gluetun_err}"
+            fi
+            echo "  Common fixes:"
+            echo "    - WIREGUARD_PRIVATE_KEY must be YOUR client private key (not the server PublicKey)"
+            echo "    - WIREGUARD_ADDRESSES needs CIDR form, e.g. 10.2.0.2/32"
+            echo "    - SERVER_CITIES must match a city in gluetun's list for your provider (leave blank to let gluetun pick)"
+            echo "  Edit:  sudo nano ${OB_ENV_FILE}  →  fix offending line  →  sudo openbox restart media"
+        fi
+    fi
+    echo ""
+
+    # --- Hardware Transcoding ---
+    echo -e "${BOLD}[Hardware Transcoding]${NC}"
+    if [[ -d /dev/dri ]]; then
+        log_ok "/dev/dri exists -- GPU devices detected"
+        ls -la /dev/dri/ 2>/dev/null | while read -r line; do
+            echo "  ${line}"
+        done
+        # Check for Intel Quick Sync
+        if [[ -e /dev/dri/renderD128 ]]; then
+            log_ok "Intel Quick Sync / GPU render device available (renderD128)"
+        fi
+        # Check if current user can access it
+        if [[ -r /dev/dri/renderD128 ]] 2>/dev/null; then
+            log_ok "Render device is accessible by current user"
+        else
+            log_warn "Render device may not be accessible -- check group membership (video/render)"
+            ((issues++))
+        fi
+    else
+        log_info "/dev/dri not found -- hardware transcoding not available"
+        if [[ "${IS_NAS}" == "true" ]]; then
+            log_info "Check your NAS settings to enable GPU passthrough for Docker."
+        fi
+    fi
+    echo ""
+
+    # --- Media Root ---
+    echo -e "${BOLD}[Media Storage]${NC}"
+    if [[ -f "${OB_ENV_FILE}" ]]; then
+        local media_root
+        media_root=$(grep '^MEDIA_ROOT=' "${OB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || echo "")
+        if [[ -n "${media_root}" ]]; then
+            if [[ "${media_root}" =~ [[:space:]] ]]; then
+                # v1.6.69: docker-compose's volume substitution splits on
+                # whitespace, so a space in MEDIA_ROOT silently breaks every
+                # container's media bind mount. cmd_up rejects this case
+                # outright; doctor surfaces it separately so a `openbox
+                # doctor` run on an unstarted install also catches it.
+                log_warn "MEDIA_ROOT contains whitespace ('${media_root}') — bind mounts will fail silently. Symlink to a no-space path and update .env."
+                ((issues++))
+            elif [[ -d "${media_root}" ]]; then
+                log_ok "MEDIA_ROOT=${media_root} exists"
+                if [[ -w "${media_root}" ]]; then
+                    log_ok "MEDIA_ROOT is writable"
+                else
+                    log_warn "MEDIA_ROOT is not writable by current user"
+                    ((issues++))
+                fi
+                local media_free
+                media_free=$(df -BG "${media_root}" 2>/dev/null | awk 'NR==2 {print int($4)}')
+                log_info "Free space at MEDIA_ROOT: ${media_free}GB"
+            else
+                log_warn "MEDIA_ROOT=${media_root} does not exist"
+                ((issues++))
+            fi
+        else
+            log_info "MEDIA_ROOT not set (media module may not be enabled)"
+        fi
+    fi
+    echo ""
+
+    # --- RAM ---
+    echo -e "${BOLD}[System Resources]${NC}"
+    if [[ -f /proc/meminfo ]]; then
+        local total_ram_mb free_ram_mb
+        total_ram_mb=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+        free_ram_mb=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo)
+        log_info "Total RAM: ${total_ram_mb}MB"
+        log_info "Available RAM: ${free_ram_mb}MB"
+
+        local enabled_count
+        enabled_count=$(get_enabled_modules | wc -l)
+        # Rough estimate: ~512MB per module
+        local estimated_need=$((enabled_count * 512))
+        if [[ ${free_ram_mb} -lt ${estimated_need} ]]; then
+            log_warn "Available RAM (${free_ram_mb}MB) may be tight for ${enabled_count} modules (~${estimated_need}MB estimated)"
+            ((issues++))
+        else
+            log_ok "RAM looks sufficient for ${enabled_count} enabled modules"
+        fi
+    fi
+
+    local disk_free
+    disk_free=$(df -BG "${OB_ROOT}" 2>/dev/null | awk 'NR==2 {print int($4)}')
+    log_info "Free disk at OB_ROOT: ${disk_free}GB"
+    if [[ ${disk_free} -lt 10 ]]; then
+        log_warn "Low disk space at ${OB_ROOT}"
+        ((issues++))
+    fi
+    echo ""
+
+    # --- NAS-specific checks ---
+    if [[ "${IS_NAS}" == "true" ]]; then
+        echo -e "${BOLD}[NAS-Specific]${NC}"
+        log_info "NAS type: ${NAS_TYPE}"
+        log_info "Install directory: ${OB_ROOT}"
+
+        # Check if install dir is on a data volume (not system partition)
+        case "${OB_ROOT}" in
+            /volume*|/mnt/*|/share/*)
+                log_ok "Install directory is on a data volume"
+                ;;
+            /opt/*)
+                log_warn "Install directory is on system partition -- consider moving to a data volume"
+                ;;
+        esac
+        echo ""
+    fi
+
+    # --- Summary ---
+    echo -e "${BOLD}============================================${NC}"
+    if [[ ${issues} -eq 0 ]]; then
+        echo -e "  ${GREEN}${BOLD}All checks passed!${NC}"
+    else
+        echo -e "  ${YELLOW}${BOLD}${issues} issue(s) found.${NC}"
+        echo -e "  Review warnings above and fix as needed."
+    fi
+    echo -e "${BOLD}============================================${NC}"
+
+    return ${issues}
+}
+
+# Print the host's network profile classification recorded during install.
+# Mostly diagnostic — surfaces the data future hardening (NPM cred rotation,
+# DNS guards, VPS-aware UFW posture) will consume. JSON output for the
+# dashboard / scripted callers; plain text for humans.
+cmd_env() {
+    local json_out=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --json) json_out=true; shift ;;
+            *)      shift ;;
+        esac
+    done
+
+    if [[ "${json_out}" == "true" ]]; then
+        # v1.6.59 audit fix: the prior awk-based JSON encoder mangled
+        # backslashes (awk's regex engine ate them) and didn't escape
+        # newlines / control chars, producing invalid JSON if reasons
+        # ever contained adversarial input. python3 is already a
+        # OpenBox dependency (CLI uses it for support-status, portainer
+        # bcrypt, JSON parsing of state files); switching to it
+        # eliminates the encoder bugs entirely. Values are passed via
+        # argv (no shell expansion) so the JSON stays well-formed even
+        # for arbitrary string contents.
+        if command -v python3 &>/dev/null; then
+            python3 -c '
+import json, sys
+profile, is_nas_str, nas_type, reasons_raw = sys.argv[1:5]
+reasons = [r.strip() for r in reasons_raw.split(";") if r.strip()]
+print(json.dumps({
+    "profile": profile,
+    "is_nas": is_nas_str == "true",
+    "nas_type": nas_type,
+    "reasons": reasons,
+}))
+' "${OB_PROFILE:-unknown}" "${IS_NAS:-false}" "${NAS_TYPE}" "${OB_PROFILE_REASONS}"
+        else
+            # No python3 — fall back to a minimal manual encoder. We
+            # know the detector only emits ASCII-safe strings (default-
+            # route IPs, cloud provider slugs, fixed reason templates),
+            # so the simple replace-quotes-and-backslashes pass is
+            # sufficient for every value the detector itself produces.
+            # If a future caller injects rich content into install-
+            # meta.conf they should install python3 for correct output.
+            local p="${OB_PROFILE:-unknown}"
+            local n="${NAS_TYPE}"
+            local r="${OB_PROFILE_REASONS}"
+            # Minimal escape: backslash, double-quote, newline, tab.
+            p=${p//\\/\\\\}; p=${p//\"/\\\"}
+            n=${n//\\/\\\\}; n=${n//\"/\\\"}
+            local IFS=';'
+            local reasons_json="["
+            local first=1
+            for s in ${r}; do
+                # trim leading whitespace
+                s="${s#"${s%%[![:space:]]*}"}"
+                [[ -z "${s}" ]] && continue
+                s=${s//\\/\\\\}; s=${s//\"/\\\"}
+                if [[ "${first}" -eq 1 ]]; then
+                    reasons_json+="\"${s}\""
+                    first=0
+                else
+                    reasons_json+=",\"${s}\""
+                fi
+            done
+            reasons_json+="]"
+            printf '{"profile":"%s","is_nas":%s,"nas_type":"%s","reasons":%s}\n' \
+                "${p}" \
+                "$( [[ "${IS_NAS}" == "true" ]] && echo true || echo false )" \
+                "${n}" \
+                "${reasons_json}"
+        fi
+        return 0
+    fi
+
+    echo -e "${BOLD}OpenBox network profile${NC}"
+    echo "  profile  : ${OB_PROFILE:-unknown}"
+    echo "  is_nas   : ${IS_NAS}"
+    [[ -n "${NAS_TYPE}" ]] && echo "  nas_type : ${NAS_TYPE}"
+    if [[ -n "${OB_PROFILE_REASONS}" ]]; then
+        echo "  reasons  :"
+        IFS=';' read -ra _reasons <<< "${OB_PROFILE_REASONS}"
+        for r in "${_reasons[@]}"; do
+            [[ -z "${r}" ]] && continue
+            echo "    - ${r}"
+        done
+    fi
+    echo ""
+    case "${OB_PROFILE}" in
+        public)
+            echo -e "${YELLOW}This host has a publicly-routable IP.${NC} Review the VPS"
+            echo "hardening checklist at https://crushcodeworks.com/docs.html#vps-hardening"
+            ;;
+        private)
+            echo "This host appears to be on a private network (NAT'd home/lab box)."
+            echo "Inbound services are not internet-reachable unless you forward ports."
+            ;;
+        nas)
+            echo "Running on a NAS appliance. Network exposure is governed by your"
+            echo "router and NAS-level port forwarding rules."
+            ;;
+        *)
+            echo "Network profile is unknown. This install predates v1.6.58 — re-run"
+            echo "install.sh (or 'openbox update') to refresh classification."
+            ;;
+    esac
+}
+
+cmd_help() {
+    banner
+    echo -e "${BOLD}Usage:${NC} openbox <command> [options]"
+    echo ""
+    echo -e "${BOLD}Commands:${NC}"
+    echo "  install              Run initial setup wizard"
+    echo "  up                   Start all enabled modules"
+    echo "  down                 Stop everything"
+    echo "  status               Show all service statuses"
+    echo "  modules              List available/enabled modules"
+    echo "  enable <module>      Enable and configure a module"
+    echo "  disable <module>     Stop and disable a module"
+    echo "  restart [module]     Restart all or one module"
+    echo "  update [module]      Pull latest images, recreate containers"
+    echo "  reset [--soft|--hard|--nuke]"
+    echo "                       Reset OpenBox. --soft stops & removes containers (keeps data),"
+    echo "                       --hard also wipes data/configs, --nuke removes everything"
+    echo "  logs <service>       Tail container logs"
+    echo "  backup [--config-only] [--dest /path]"
+    echo "                       Full backup (config + data) by default."
+    echo "                       --config-only for secrets + configs only (fast, ~20K)."
+    echo "                       --dest to save directly to a USB drive or network share."
+    echo "  restore <file>       Restore from backup"
+    echo "  config               Re-run configuration wizard"
+    echo "  reset-password       Set a new dashboard admin password (requires sudo)"
+  echo "  factory-reset        Wipe module configs/data + state; keep .env, backups, /data."
+  echo "                       Boots into the first-run wizard. Your admin password stays."
+    echo "  urls                 Show service URLs"
+    echo "  doctor               Run diagnostics and health checks"
+    echo "  env [--json]         Show this host's network profile (nas / private / public)"
+    echo "                       and the reasons it was classified that way."
+    echo "  repair-network       Tear down + rebuild ob_proxy and containers"
+    echo "                       (recovery for stale Docker NAT rules)"
+    echo "  repair-portainer     Wipe Portainer DB + regenerate admin password"
+    echo "                       (recovery for the 422 admin-auth class-level bug)"
+    echo "  repair-seerr         Wipe Seerr config + restart with correct ownership"
+    echo "                       (recovery for the EACCES /app/config/logs/ boot loop)"
+    echo "  support {enable|disable|status}"
+    echo "                       Open a 4-hour remote-support session via Tailscale"
+    echo "                       so Tom can SSH in to debug. Auto-revokes."
+    echo "  help                 Show this help"
+    echo ""
+    echo -e "${BOLD}Modules:${NC}"
+    for mod in $(discover_modules); do
+        local title required
+        title=$(read_openbox_field "${mod}" "title")
+        required=$(read_openbox_field "${mod}" "required")
+        [[ -z "${title}" ]] && title="${mod}"
+        if [[ "${required}" == "true" ]]; then
+            echo "  ${mod}$(printf '%*s' $((16 - ${#mod})) '')${title} (always on)"
+        else
+            echo "  ${mod}$(printf '%*s' $((16 - ${#mod})) '')${title}"
+        fi
+    done
+    echo ""
+}
+
+# --- Main ---
+
+main() {
+    local command="${1:-help}"
+    shift 2>/dev/null || true
+
+    case "${command}" in
+        install)  cmd_install "$@" ;;
+        up)       cmd_up "$@" ;;
+        down)     cmd_down "$@" ;;
+        repair-network) cmd_repair_network "$@" ;;
+        repair-portainer) cmd_repair_portainer "$@" ;;
+        repair-seerr) cmd_repair_seerr "$@" ;;
+        support)  cmd_support "$@" ;;
+        status)   cmd_status "$@" ;;
+        modules)  cmd_modules "$@" ;;
+        enable)   cmd_enable "$@" ;;
+        disable)  cmd_disable "$@" ;;
+        restart)  cmd_restart "$@" ;;
+        update)   cmd_update "$@" ;;
+        reset)    cmd_reset "$@" ;;
+        factory-reset) cmd_factory_reset "$@" ;;
+        logs)     cmd_logs "$@" ;;
+        backup)   cmd_backup "$@" ;;
+        restore)  cmd_restore "$@" ;;
+        config)   cmd_config "$@" ;;
+        reset-password) cmd_reset_password "$@" ;;
+        urls)     cmd_urls "$@" ;;
+        doctor)   cmd_doctor "$@" ;;
+        env)      cmd_env "$@" ;;
+        qa)       bash "${OB_ROOT}/scripts/qa-full.sh" "$@" ;;
+        arr-bootstrap)
+                  # Wires Sonarr+Radarr+Prowlarr+qBittorrent together so
+                  # users don't have to copy-paste API keys between five
+                  # web UIs. Idempotent. Auto-runs after enabling media.
+                  OB_ROOT="${OB_ROOT}" bash "${OB_ROOT}/scripts/arr-bootstrap.sh" "$@" ;;
+        media-finish)
+                  # Closes the last-mile gap on Media setup: creates
+                  # Movies/TV/Music subdirs, pre-creates Jellyfin
+                  # libraries via its REST API (using Seerr's stored
+                  # Jellyfin key), and marks Seerr's wizard complete.
+                  # Runs after Seerr has been signed in to Jellyfin.
+                  OB_ROOT="${OB_ROOT}" bash "${OB_ROOT}/scripts/media-finish.sh" "$@" ;;
+        media-autoseed)
+                  # Zero-credential media setup: drives Jellyfin's
+                  # first-run wizard via headless Chromium, creates an
+                  # admin user with a generated password, mints a
+                  # Jellyfin API key, and signs Seerr in via its API.
+                  # Idempotent — re-runnable, short-circuits if already
+                  # seeded. Follow with `openbox media-finish` to
+                  # create libraries.
+                  OB_ROOT="${OB_ROOT}" bash "${OB_ROOT}/scripts/media-autoseed.sh" "$@" ;;
+        bootstrap-token)
+                  # Re-read the one-time bootstrap token from .env so
+                  # users who lost the installer output can still claim
+                  # the dashboard. If the token is empty or missing,
+                  # it was already consumed — log in with the admin
+                  # password the dashboard set during first-run.
+                  token="$(grep '^OB_BOOTSTRAP_TOKEN=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)"
+                  if [[ -z "${token}" ]]; then
+                      echo "Bootstrap token has already been claimed. Log in with your admin password." >&2
+                      echo "To reset the password: sudo ${OB_ROOT}/openbox reset-password" >&2
+                      exit 1
+                  fi
+                  echo "${token}" ;;
+        help|--help|-h)
+                  cmd_help ;;
+        version|--version|-v)
+                  echo "OpenBox v${OB_VERSION}" ;;
+        *)
+            log_error "Unknown command: ${command}"
+            echo "Run 'openbox help' for usage."
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"

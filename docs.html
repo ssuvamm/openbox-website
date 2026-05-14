@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Documentation — OpenBox</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css">
+  <style>
+    *,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+    :root{--bg:#08080c;--bg-2:#0e0e14;--bg-3:#14141c;--bg-4:#1a1a26;--text:#f0f0f8;--text-2:#a8a8c0;--text-3:#686888;--accent:#7c5cff;--accent-2:#9d7fff;--accent-glow:rgba(124,92,255,0.3);--cyan:#22d3ee;--green:#34d399;--border:rgba(255,255,255,0.06);--border-2:rgba(255,255,255,0.1)}
+    html{scroll-behavior:smooth}
+    ::-webkit-scrollbar{width:6px}
+    ::-webkit-scrollbar-track{background:var(--bg)}
+    ::-webkit-scrollbar-thumb{background:var(--accent);border-radius:3px}
+    body{font-family:'Inter',system-ui,sans-serif;background:var(--bg);color:var(--text);overflow-x:hidden;line-height:1.7}
+    a{color:var(--accent-2);text-decoration:none}
+    a:hover{text-decoration:underline}
+    .container{max-width:900px;margin:0 auto;padding:0 24px}
+
+    nav{position:fixed;top:0;left:0;right:0;z-index:1000;padding:16px 0;background:rgba(8,8,12,0.9);backdrop-filter:blur(20px);border-bottom:1px solid var(--border)}
+    nav .container{display:flex;align-items:center;justify-content:space-between}
+    .nav-logo{display:flex;align-items:center;gap:10px;font-size:20px;font-weight:700;color:var(--text);text-decoration:none;letter-spacing:-0.5px}
+    .nav-logo-icon{width:32px;height:32px;background:linear-gradient(135deg,var(--accent),var(--cyan));border-radius:8px;display:flex;align-items:center;justify-content:center;font-size:16px;box-shadow:0 0 20px var(--accent-glow)}
+    .nav-links{display:flex;align-items:center;gap:28px}
+    .nav-links a{color:var(--text-2);font-size:14px;font-weight:500;transition:color 0.2s}
+    .nav-links a:hover{color:var(--text);text-decoration:none}
+    .nav-links a.active{color:var(--accent-2)}
+
+    .docs-layout{display:flex;padding-top:80px;min-height:100vh}
+    .docs-sidebar{width:240px;flex-shrink:0;position:sticky;top:80px;height:calc(100vh - 80px);overflow-y:auto;padding:32px 24px 32px 0;border-right:1px solid var(--border)}
+    .docs-sidebar h3{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px;color:var(--text-3);margin:24px 0 12px}
+    .docs-sidebar h3:first-child{margin-top:0}
+    .docs-sidebar a{display:block;font-size:14px;color:var(--text-2);padding:6px 12px;border-radius:6px;transition:all 0.2s}
+    .docs-sidebar a:hover{color:var(--text);background:var(--bg-3);text-decoration:none}
+    .docs-sidebar a.active{color:var(--accent-2);background:rgba(124,92,255,0.1)}
+    .docs-content{flex:1;padding:48px 48px 100px;max-width:800px}
+
+    h1{font-size:40px;font-weight:800;letter-spacing:-1px;margin-bottom:16px;background:linear-gradient(135deg,var(--text),var(--accent-2));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+    h2{font-size:26px;font-weight:700;margin:48px 0 16px;padding-top:48px;border-top:1px solid var(--border)}
+    h2:first-of-type{border-top:none;padding-top:0}
+    h3{font-size:18px;font-weight:600;margin:24px 0 12px;color:var(--text)}
+    p{margin-bottom:16px;color:var(--text-2)}
+    ul,ol{margin:0 0 16px 24px;color:var(--text-2)}
+    li{margin-bottom:6px}
+    code{font-family:'JetBrains Mono',monospace;font-size:13px;background:var(--bg-3);padding:2px 8px;border-radius:4px;color:var(--cyan)}
+    pre{background:var(--bg-2);border:1px solid var(--border);border-radius:8px;padding:20px;margin:16px 0;overflow-x:auto}
+    pre code{background:none;padding:0;font-size:13px;color:var(--text)}
+    .copy-btn{float:right;background:var(--bg-4);border:1px solid var(--border-2);color:var(--text-2);padding:4px 12px;border-radius:4px;cursor:pointer;font-size:12px}
+    .copy-btn:hover{background:var(--accent);color:white}
+    table{width:100%;border-collapse:collapse;margin:16px 0}
+    th{text-align:left;padding:10px 14px;background:var(--bg-2);border:1px solid var(--border);font-size:13px;font-weight:600;color:var(--text)}
+    td{padding:10px 14px;border:1px solid var(--border);font-size:14px;color:var(--text-2)}
+    tr:hover td{background:var(--bg-2)}
+    .callout{padding:16px 20px;border-radius:8px;margin:20px 0;border-left:3px solid var(--accent)}
+    .callout.info{background:rgba(124,92,255,0.08);border-color:var(--accent)}
+    .callout.warning{background:rgba(251,191,36,0.08);border-color:#fbbf24}
+    .callout.danger{background:rgba(239,68,68,0.08);border-color:#ef4444}
+    .callout.success{background:rgba(52,211,153,0.08);border-color:#34d399}
+    .callout p:last-child{margin-bottom:0}
+    .callout strong{display:block;margin-bottom:4px;font-size:13px;text-transform:uppercase;letter-spacing:0.5px}
+    hr{border:none;border-top:1px solid var(--border);margin:48px 0}
+    .breadcrumb{font-size:13px;color:var(--text-3);margin-bottom:24px}
+    .breadcrumb a{color:var(--text-3)}
+    .breadcrumb a:hover{color:var(--text-2)}
+    .inline-code{font-family:'JetBrains Mono',monospace;font-size:13px;background:var(--bg-3);padding:2px 6px;border-radius:4px;color:var(--cyan)}
+    .hash{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--bg-3);padding:2px 8px;border-radius:4px;color:var(--green);word-break:break-all}
+
+    footer{border-top:1px solid var(--border);padding:40px 0;text-align:center;color:var(--text-3);font-size:14px}
+    footer a{color:var(--text-3)}
+    footer a:hover{color:var(--text-2)}
+  </style>
+</head>
+<body>
+<nav>
+  <div class="container">
+    <a href="index.html" class="nav-logo">
+      <div class="nav-logo-icon"><i class="fas fa-box-open"></i></div>
+      OpenBox
+    </a>
+    <div class="nav-links">
+      <a href="index.html">Home</a>
+      <a href="docs.html" class="active">Docs</a>
+      <a href="changelog.html">Changelog</a>
+      <a href="https://github.com/crushcodeworks/openbox" target="_blank"><i class="fab fa-github"></i></a>
+    </div>
+  </div>
+</nav>
+
+<div class="docs-layout">
+  <aside class="docs-sidebar">
+    <h3>Getting Started</h3>
+    <a href="#getting-help">Getting Help</a>
+    <a href="#prerequisites">Prerequisites</a>
+    <a href="#install-vps">Install (VPS)</a>
+    <a href="#install-nas">Install (NAS)</a>
+    <a href="#install-wsl">Install (WSL2)</a>
+
+    <h3>Setup</h3>
+    <a href="#setup-wizard">Setup Wizard</a>
+    <a href="#first-login">First Login</a>
+
+    <h3>Modules</h3>
+    <a href="#using-apps">Using Your Apps</a>
+    <a href="#network-setup">Network Setup</a>
+
+    <h3>Media Stack</h3>
+    <a href="#media-stack">Media Stack Overview</a>
+    <a href="#arr-stack">ARR Stack</a>
+    <a href="#vpn-setup">VPN Setup</a>
+    <a href="#indexers">Indexers</a>
+    <a href="#usenet">Usenet Setup</a>
+
+    <h3>Reference</h3>
+    <a href="#troubleshooting">Troubleshooting</a>
+    <a href="#updating">Updating</a>
+    <a href="#uninstall">Uninstall</a>
+  </aside>
+
+  <main class="docs-content">
+    <p class="breadcrumb"><a href="index.html">Home</a> / Docs</p>
+    <h1>OpenBox Documentation</h1>
+    <p>Everything you need to install, configure, and get the most out of OpenBox.</p>
+
+    <hr>
+
+    <h2 id="getting-help">Getting Help</h2>
+
+    <h3>Community Support</h3>
+    <p>OpenBox is community-supported. The best place for help is the GitHub Discussions page.</p>
+
+    <div class="callout info">
+      <strong>Before Posting</strong>
+      <p>Always run <code>openbox doctor</code> and include the output in your post. Check the troubleshooting section below — many issues are already documented with fixes.</p>
+    </div>
+
+    <h3>Bug Reports</h3>
+    <p>When reporting a bug, please include:</p>
+    <ul>
+      <li><strong>Hardware:</strong> e.g. UGREEN NAS / Hostinger VPS / WSL2 / Beelink Mini PC</li>
+      <li><strong>OS:</strong> e.g. UGOS Pro / Ubuntu 22.04 — paste <code>uname -a</code> output</li>
+      <li><strong>OpenBox version:</strong> <code>openbox --version</code></li>
+      <li><strong>Module failing:</strong> e.g. seerr / jellyfin / qbittorrent / dashboard</li>
+      <li><strong>VPN provider:</strong> Surfshark / ProtonVPN / Mullvad / none (if media-related)</li>
+      <li><strong>What happened:</strong> exact error message, not a paraphrase</li>
+      <li><strong>Logs:</strong> <code>sudo openbox logs &lt;module&gt;</code></li>
+    </ul>
+
+    <div class="callout warning">
+      <strong>Security — Never Share These</strong>
+      <p>Do not post full license keys, plaintext passwords, API keys (Sonarr, Radarr, Prowlarr, Anthropic), VPN credentials, WireGuard private keys, or full <code>.env</code> files. Share last 4 characters of license key only.</p>
+    </div>
+
+    <hr>
+
+    <h2 id="prerequisites">Prerequisites</h2>
+
+    <h3>VPS Requirements</h3>
+    <table>
+      <tr><th>Requirement</th><th>Minimum</th><th>Recommended</th></tr>
+      <tr><td>RAM</td><td>2 GB</td><td>4–8 GB</td></tr>
+      <tr><td>vCPU</td><td>1</td><td>2–4</td></tr>
+      <tr><td>Disk</td><td>20 GB</td><td>50 GB+</td></tr>
+      <tr><td>Access</td><td>Root or sudo</td><td>Root</td></tr>
+    </table>
+
+    <h3>Supported Distros</h3>
+    <ul>
+      <li><strong>Debian-based:</strong> Ubuntu 22.04+, Debian 12+, Linux Mint, Pop!_OS, Raspberry Pi OS, Kali</li>
+      <li><strong>RHEL-based:</strong> Rocky Linux, AlmaLinux, Fedora, RHEL, CentOS Stream</li>
+      <li><strong>Arch-based:</strong> Arch Linux, Manjaro, EndeavourOS</li>
+    </ul>
+
+    <h3>Outbound Access Required</h3>
+    <p>Your server needs outbound HTTPS to:</p>
+    <ul>
+      <li><code>openbox.crushcodeworks.com</code> — release downloads</li>
+      <li><code>webhook.tomsparkbox.com</code> — license validation (optional, Pro feature)</li>
+    </ul>
+
+    <h3>NAS Requirements</h3>
+    <ul>
+      <li><strong>UGREEN NASync NAS</strong> (DXP2800, DXP4800, or similar Docker-capable model)</li>
+      <li><strong>4 GB+ RAM</strong> (8 GB recommended, 16 GB for media + photo modules)</li>
+      <li>SSH access enabled</li>
+      <li>VPN subscription (only if enabling Media module)</li>
+    </ul>
+
+    <hr>
+
+    <h2 id="install-vps">Installing on a VPS</h2>
+
+    <pre><code># Step 1: Connect to your server
+ssh root@YOUR_SERVER_IP
+
+# Step 2: Update the system
+apt update && apt upgrade -y
+
+# Step 3: Run the installer
+curl -fsSL https://openbox.crushcodeworks.com/install.sh | sudo bash
+
+# Or inspect before running:
+curl -fsSL https://openbox.crushcodeworks.com/install.sh -o install.sh
+less install.sh
+sudo bash install.sh</code></pre>
+
+    <h3>Recommended VPS Providers</h3>
+    <table>
+      <tr><th>Provider</th><th>Min Plan</th><th>Notes</th></tr>
+      <tr><td>Hostinger</td><td>KVM 1 (4GB, 2vCPU) ~$5/mo</td><td>Recommended — fast and affordable</td></tr>
+      <tr><td>Hetzner</td><td>CX22 (4GB, 2vCPU) ~$5/mo</td><td>Best value, EU + US regions</td></tr>
+      <tr><td>DigitalOcean</td><td>Basic 4GB ~$24/mo</td><td>Simple and reliable</td></tr>
+      <tr><td>Vultr</td><td>Cloud Compute 4GB ~$24/mo</td><td>Global locations</td></tr>
+    </table>
+
+    <hr>
+
+    <h2 id="install-nas">Installing on UGREEN NAS</h2>
+
+    <ol>
+      <li><strong>Enable SSH:</strong> Control Panel → Terminal → Enable SSH Service → Restart NAS</li>
+      <li><strong>Connect via SSH:</strong>
+        <pre><code>ssh your-admin-username@192.168.1.17</code></pre>
+      </li>
+      <li><strong>Verify Docker:</strong>
+        <pre><code>docker --version
+docker compose version
+# If Docker is missing:
+curl -fsSL https://get.docker.com | sh</code></pre>
+      </li>
+      <li><strong>Install OpenBox:</strong>
+        <pre><code>curl -fsSL https://openbox.crushcodeworks.com/install.sh | sudo bash</code></pre>
+      </li>
+    </ol>
+
+    <h3>Port Conflicts on UGREEN NAS</h3>
+    <table>
+      <tr><th>Port</th><th>UGOS Uses</th><th>OpenBox Default</th><th>Resolution</th></tr>
+      <tr><td>80</td><td>UGOS Web UI</td><td>NPM HTTP</td><td>OpenBox uses 8080 on NAS</td></tr>
+      <tr><td>443</td><td>UGOS Web UI</td><td>NPM HTTPS</td><td>OpenBox uses 8443 on NAS</td></tr>
+      <tr><td>53</td><td>dnsmasq</td><td>Pi-hole DNS</td><td><code>sudo systemctl disable dnsmasq</code></td></tr>
+    </table>
+
+    <hr>
+
+    <h2 id="install-wsl">Installing on WSL2 (Windows)</h2>
+
+    <p>WSL2 is community-supported. Ubuntu from the Microsoft Store works best.</p>
+
+    <pre><code># Install Ubuntu from Microsoft Store, then:
+wsl -d Ubuntu
+curl -fsSL https://openbox.crushcodeworks.com/install.sh | sudo bash</code></pre>
+
+    <div class="callout info">
+      <strong>Docker on WSL2</strong>
+      <p>WSL2 requires Docker Desktop installed on Windows, or you can install Docker inside WSL2 with <code>curl -fsSL https://get.docker.com | sh</code>. For the best experience, use Docker Desktop with WSL2 integration enabled.</p>
+    </div>
+
+    <hr>
+
+    <h2 id="setup-wizard">Setup Wizard</h2>
+
+    <p>The wizard runs automatically after installation. It configures:</p>
+    <ul>
+      <li><strong>Server Address</strong> — IP or domain of your server</li>
+      <li><strong>Timezone</strong> — Format: <code>Continent/City</code> (e.g. <code>America/New_York</code>)</li>
+      <li><strong>Module Selection</strong> — Toggle modules on/off with arrow keys + space</li>
+      <li><strong>VPN Credentials</strong> — Required only if you enabled the Media module</li>
+    </ul>
+
+    <hr>
+
+    <h2 id="first-login">First Login</h2>
+
+    <p>After installation, open the dashboard at:</p>
+    <pre><code>http://YOUR_SERVER_IP:8443</code></pre>
+
+    <p>You'll be greeted with a bootstrap token. Copy it from the terminal output or run:</p>
+    <pre><code>sudo openbox bootstrap-token</code></pre>
+
+    <h3>Dashboard Navigation</h3>
+    <ul>
+      <li><strong>App Store</strong> — Enable/disable modules</li>
+      <li><strong>Settings</strong> — Configure VPN, network, backups</li>
+      <li><strong>Help</strong> — Docs, logs, support links</li>
+    </ul>
+
+    <h3>Finding App Passwords</h3>
+    <p>Click any app tile in the dashboard — a modal shows the auto-generated username and password. These are saved in <code>/opt/openbox/state/</code> as plaintext files.</p>
+
+    <hr>
+
+    <h2 id="using-apps">Using Your Apps</h2>
+
+    <p>OpenBox organizes apps into modules. Enable modules from the dashboard App Store.</p>
+
+    <h3>Core Modules</h3>
+    <ul>
+      <li><strong>Dashboard</strong> — OpenBox web UI on port 8443</li>
+      <li><strong>Nginx Proxy Manager</strong> — Reverse proxy + SSL termination on ports 80/443</li>
+      <li><strong>Portainer</strong> — Container management UI on port 9000</li>
+    </ul>
+
+    <h3>Media Modules</h3>
+    <ul>
+      <li><strong>Jellyfin</strong> — Media server (port 8096)</li>
+      <li><strong>Sonarr</strong> — TV show management</li>
+      <li><strong>Radarr</strong> — Movie management</li>
+      <li><strong>Prowlarr</strong> — Indexer manager</li>
+      <li><strong>Lidarr</strong> — Music management</li>
+      <li><strong>Bazarr</strong> — Subtitle management</li>
+      <li><strong>qBittorrent</strong> — Torrent client</li>
+      <li><strong>SABnzbd</strong> — Usenet client</li>
+    </ul>
+
+    <h3>Privacy Modules</h3>
+    <ul>
+      <li><strong>Pi-hole</strong> — Network-wide ad blocking on port 8053</li>
+      <li><strong>Vaultwarden</strong> — Password manager on port 8222</li>
+      <li><strong>AdGuard Home</strong> — Alternative DNS sinkhole</li>
+    </ul>
+
+    <h3>Utility Modules</h3>
+    <ul>
+      <li><strong>Uptime Kuma</strong> — Server monitoring</li>
+      <li><strong>Grafana + Prometheus</strong> — Metrics dashboards</li>
+      <li><strong>HomeHub</strong> — Browser-based home dashboard</li>
+      <li><strong>Linkding</strong> — Self-hosted bookmarks</li>
+      <li><strong>Actual Budget</strong> — Personal finance</li>
+    </ul>
+
+    <hr>
+
+    <h2 id="network-setup">Setting Up Your Network</h2>
+
+    <h3>Local Network Access</h3>
+    <p>All apps are accessible at <code>http://YOUR_SERVER_IP:PORT</code> from devices on the same network.</p>
+
+    <h3>WireGuard VPN</h3>
+    <p>Enable the VPN module for remote access. Clients download a config file from the dashboard → VPN tab.</p>
+    <pre><code># On your phone/laptop, install WireGuard app, import the config file
+# Connect from anywhere — all traffic goes through your home server</code></pre>
+
+    <h3>Tailscale</h3>
+    <p>Enable Tailscale for zero-config remote access without port forwarding. Add your auth key in Settings → Remote Access.</p>
+
+    <h3>Custom Domain + SSL</h3>
+    <p>Nginx Proxy Manager handles SSL automatically. Point your domain's DNS to your server IP, then add a proxy host in NPM.</p>
+
+    <hr>
+
+    <h2 id="media-stack">Media Stack Overview</h2>
+
+    <p>The media stack is a suite of apps that work together to automatically find, download, and organize your media.</p>
+
+    <div class="callout warning">
+      <strong>VPN Required for Media</strong>
+      <p>The Media module requires a VPN subscription. OpenBox recommends Surfshark — affordable, fast for BitTorrent, and works with gluetun out of the box.</p>
+    </div>
+
+    <h3>Flow</h3>
+    <p><strong>Seerr</strong> (request UI) → <strong>Prowlarr</strong> (indexer search) → <strong>Sonarr/Radarr</strong> (release detection) → <strong>qBittorrent/SABnzbd</strong> (download) → <strong>Jellyfin</strong> (playback)</p>
+
+    <h3>First-Time Setup</h3>
+    <ol>
+      <li>Enable the <strong>Media</strong> module in App Store</li>
+      <li>Configure VPN credentials in Settings → Network → VPN</li>
+      <li>Add at least one <strong>indexer</strong> in Prowlarr (Settings → Indexers → Add)</li>
+      <li>Request a movie or TV show in Seerr</li>
+    </ol>
+
+    <hr>
+
+    <h2 id="arr-stack">ARR Stack</h2>
+
+    <p>The "ARR stack" (Sonarr, Radarr, Prowlarr, Lidarr, Bazarr) is auto-configured by OpenBox's <code>arr-bootstrap</code> script, which runs automatically when the media module starts.</p>
+
+    <h3>ARR Bootstrap Does This</h3>
+    <ul>
+      <li>Generates stable API keys per app</li>
+      <li>Wires download clients (qBittorrent, SABnzbd) to each ARR</li>
+      <li>Creates quality profiles</li>
+      <li>Registers Prowlarr as indexer in Sonarr/Radarr/Lidarr</li>
+      <li>Configures FlareSolverr for Cloudflare-bypassing indexers</li>
+      <li>Self-heals on every <code>openbox up</code></li>
+    </ul>
+
+    <h3>Default Paths</h3>
+    <table>
+      <tr><th>App</th><th>Port</th><th>Download Path</th></tr>
+      <tr><td>Seerr</td><td>5055</td><td>Media request UI</td></tr>
+      <tr><td>Sonarr</td><td>8989</td><td>/data/TV</td></tr>
+      <tr><td>Radarr</td><td>7878</td><td>/data/Movies</td></tr>
+      <tr><td>Prowlarr</td><td>9696</td><td>Indexer manager</td></tr>
+      <tr><td>Lidarr</td><td>8686</td><td>/data/Music</td></tr>
+      <tr><td>Bazarr</td><td>6767</td><td>Subtitles</td></tr>
+    </table>
+
+    <hr>
+
+    <h2 id="vpn-setup">VPN Setup</h2>
+
+    <h3>Recommended: Surfshark</h3>
+    <p>Surfshark wins on price (~$2.20/mo), speed (16× faster than ProtonVPN in real BitTorrent tests), and simplicity — all servers allow P2P.</p>
+
+    <h3>Getting Your WireGuard Key</h3>
+    <ol>
+      <li>Sign up → <a href="https://get.surfshark.net/aff_c?offer_id=1126&aff_id=9447&aff_sub=hr52es">Surfshark</a></li>
+      <li><strong>My Account</strong> → <strong>VPN</strong> tab → <strong>Manual setup</strong> → <strong>Router</strong> → <strong>WireGuard</strong></li>
+      <li>Generate a key pair, copy the <strong>Private Key</strong> and <strong>Address</strong></li>
+      <li>Paste into OpenBox Settings → Network → VPN</li>
+    </ol>
+
+    <h3>Other Supported Providers</h3>
+    <p><strong>Tested:</strong> Surfshark ✓, ProtonVPN ✓</p>
+    <p><strong>Should work</strong> (via gluetun): Mullvad, IVPN, Private Internet Access, NordVPN, ExpressVPN, Windscribe, HideMyAss, PureVPN, VyprVPN, PrivateVPN, Privado, PerfectPrivacy, AirVPN</p>
+
+    <h3>VPN Kill Switch</h3>
+    <p>gluetun (the VPN tunnel container) has a built-in kill switch. If the VPN drops, all media download containers lose internet access — your real IP is never exposed.</p>
+
+    <hr>
+
+    <h2 id="indexers">Indexers</h2>
+
+    <p>Indexers tell Prowlarr where to search for torrents. OpenBox does not pre-configure any indexers — you choose based on your region and content.</p>
+
+    <h3>Recommended Free Indexers</h3>
+    <ul>
+      <li><strong>Jackett</strong> — Aggregates many public trackers</li>
+      <li><strong>2 Cathedra</strong> — Good general coverage</li>
+      <li><strong>Ninja CENTRAL</strong> — Popular community indexer</li>
+    </ul>
+
+    <h3>Adding an Indexer</h3>
+    <ol>
+      <li>Open Prowlarr at <code>http://YOUR_IP:9696</code></li>
+      <li>Settings → Indexers → Add → Choose type (Torznab for Jackett, or direct)</li>
+      <li>Fill in the indexer URL and API key</li>
+      <li>Test and save</li>
+    </ol>
+
+    <div class="callout info">
+      <strong>Cloudflare-Bypassing Indexers</strong>
+      <p>Some indexers use Cloudflare protection. OpenBox includes FlareSolverr in the media stack to automatically bypass this. Indexers that require Cloudflare will work automatically.</p>
+    </div>
+
+    <hr>
+
+    <h2 id="usenet">Usenet Setup</h2>
+
+    <p>Usenet is faster and more reliable than public torrents for TV and movies, but requires a paid provider (~ $10/mo) and indexer (~$10/yr).</p>
+
+    <h3>Provider + Indexer</h3>
+    <ul>
+      <li><strong>Provider:</strong> Newshosting, Eweka, Easynews</li>
+      <li><strong>Indexer:</strong> NZBgeek, Drunkenslug, DogNZB</li>
+    </ul>
+
+    <h3>Configuring SABnzbd</h3>
+    <ol>
+      <li>Open SABnzbd at <code>http://YOUR_IP:8080</code></li>
+      <li>Add your Usenet provider in Settings → Servers</li>
+      <li>Add your indexer in Settings → Indexers</li>
+      <li>SABnzbd is automatically wired to Prowlarr by arr-bootstrap</li>
+    </ol>
+
+    <hr>
+
+    <h2 id="troubleshooting">Troubleshooting</h2>
+
+    <h3>Run the Doctor</h3>
+    <pre><code>sudo openbox doctor</code></pre>
+    <p>This checks Docker, disk space, RAM, port conflicts, module health, and VPN status. Always run this first.</p>
+
+    <h3>View Logs</h3>
+    <pre><code># All modules
+sudo openbox logs
+
+# Specific module
+sudo openbox logs jellyfin
+sudo openbox logs seerr
+sudo openbox logs qbittorrent</code></pre>
+
+    <h3>Restart a Module</h3>
+    <pre><code>sudo openbox restart media
+sudo openbox restart dashboard</code></pre>
+
+    <h3>Common Issues</h3>
+
+    <h4>Dashboard shows "Connection Refused"</h4>
+    <p>The dashboard container might not be running:</p>
+    <pre><code>sudo openbox restart dashboard</code></pre>
+
+    <h4>gluetun container stuck in "Created" state</h4>
+    <p>Your host is missing the <code>tun</code> kernel module:</p>
+    <pre><code>sudo modprobe tun
+echo tun | sudo tee -a /etc/modules
+sudo openbox restart media</code></pre>
+
+    <h4>License activation fails</h4>
+    <p>License activation requires container egress to <code>webhook.tomsparkbox.com</code>. This is an optional Pro feature — free users can skip it.</p>
+
+    <h4>qBittorrent password not working</h4>
+    <p>Run the repair command:</p>
+    <pre><code>sudo openbox repair media</code></pre>
+
+    <h4>ARR apps not downloading</h4>
+    <ol>
+      <li>Check VPN is connected: <code>sudo openbox doctor</code> → VPN Tunnel</li>
+      <li>Add an indexer in Prowlarr (without an indexer, requests queue forever)</li>
+      <li>Check qBittorrent is connected to VPN</li>
+    </ol>
+
+    <hr>
+
+    <h2 id="updating">Updating OpenBox</h2>
+
+    <h3>Automatic Updates</h3>
+    <p>OpenBox checks for updates daily. A notification appears in the dashboard when a new version is available.</p>
+
+    <h3>Manual Update</h3>
+    <pre><code>sudo openbox update</code></pre>
+
+    <h3>Rollback</h3>
+    <p>If an update causes issues, OpenBox automatically keeps a rollback copy:</p>
+    <pre><code>sudo openbox rollback</code></pre>
+
+    <hr>
+
+    <h2 id="uninstall">Uninstall</h2>
+
+    <div class="callout danger">
+      <strong>This Destroys Everything</strong>
+      <p>Uninstall removes all containers, data volumes, configs, and the OpenBox installation directory. There is no confirmation and no undo.</p>
+    </div>
+
+    <pre><code>sudo openbox reset --nuke</code></pre>
+
+    <p>This stops all containers, removes volumes, deletes <code>/opt/openbox</code>, and removes the <code>openbox</code> CLI.</p>
+
+  </main>
+</div>
+
+<footer>
+  <p><a href="index.html">Home</a> · <a href="docs.html">Docs</a> · <a href="changelog.html">Changelog</a> · <a href="https://github.com/crushcodeworks/openbox">GitHub</a></p>
+  <p style="margin-top:8px">OpenBox — Self-hosted privacy stack</p>
+</footer>
+
+</body>
+</html>
