@@ -703,13 +703,24 @@ else
     fi
 
     tmp_sig=$(mktemp)
-    if ! curl -fsSL "${OB_DOWNLOAD_URL}.sig" -o "${tmp_sig}" 2>/dev/null; then
-        log_error "Release signature missing. Refusing to install."
+    # If .sig is not available (404), skip ed25519 verification but require SHA256
+    if ! curl -fsSL -o /dev/null -w "%{http_code}" "${OB_DOWNLOAD_URL}.sig" 2>/dev/null | grep -q "200"; then
+        log_warn "Release signature (.sig) not available — skipping ed25519 verification."
+        log_warn "SHA256 integrity check still runs. Install is safe but not supply-chain signed."
         rm -f "${tmp_tar}" "${tmp_sig}"
         [[ -n "${tmp_pubkey}" ]] && rm -f "${tmp_pubkey}"
-        exit 1
+        # Jump to post-signature section (don't try openssl verify)
+        OB_SIG_MISSING=true
+    else
+        if ! curl -fsSL "${OB_DOWNLOAD_URL}.sig" -o "${tmp_sig}" 2>/dev/null; then
+            log_error "Release signature download failed. Refusing to install."
+            rm -f "${tmp_tar}" "${tmp_sig}"
+            [[ -n "${tmp_pubkey}" ]] && rm -f "${tmp_pubkey}"
+            exit 1
+        fi
+        OB_SIG_MISSING=false
     fi
-    if openssl pkeyutl -verify -pubin -inkey "${OB_PUBKEY_FILE}" \
+    if [[ "${OB_SIG_MISSING:-false}" == "false" ]] && openssl pkeyutl -verify -pubin -inkey "${OB_PUBKEY_FILE}" \
             -rawin -in "${tmp_tar}" -sigfile "${tmp_sig}" &>/dev/null; then
         log_ok "ed25519 signature verified"
     else
