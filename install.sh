@@ -14,7 +14,7 @@ set -euo pipefail
 # variable Docker's own get-docker.sh uses for its repo base URL, and
 # Docker will pick up our override and try to fetch its GPG key from it.
 OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://openbox.crushcodeworks.com/openbox.tar.gz}"
-VERSION_URL="https://crushcodeworks.com/releases/latest/version.txt"
+VERSION_URL="https://openbox.crushcodeworks.com/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
 # shipped copy of install.sh at release time.
