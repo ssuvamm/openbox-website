@@ -19,7 +19,7 @@ VERSION_URL="https://openbox.crushcodeworks.com/version.txt"
 # Public half of the OpenBox release signing key, baked into every
 # shipped copy of install.sh at release time.
 OB_BAKED_RELEASE_PUBLIC_KEY_PEM='-----BEGIN PUBLIC KEY-----
-MCowBQYDK2VwAyEA5RFEWqczIHtOHOZtiB8BNCq5QQDoGuLJdcz+ietWEkk=
+MCowBQYDK2VwAyEAqoPFFIkhxN0sSoUsTWpr5FVHNQ/OtLuTg57HxEQeCXo=
 -----END PUBLIC KEY-----'
 
 # Defaults (overridden by flags and detection)
