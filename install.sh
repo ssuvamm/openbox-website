@@ -14,6 +14,9 @@ set -euo pipefail
 # variable Docker's own get-docker.sh uses for its repo base URL, and
 # Docker will pick up our override and try to fetch its GPG key from it.
 OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://openbox.crushcodeworks.com/openbox.tar.gz}"
+# Baked SHA256 of the release tarball. Used when the .sha256 fetch fails or returns malformed data.
+# Computed at build time. Must match the tarball at the above URL.
+OB_BAKED_SHA256="caf23b9e4794cd1b819caf28dbfc47d278d2ead6879761c1beedea697cbc7863"
 VERSION_URL="https://openbox.crushcodeworks.com/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
@@ -643,9 +646,16 @@ log_info "Verifying release integrity..."
 expected_digest=$(curl -fsSL "${OB_DOWNLOAD_URL}.sha256" 2>/dev/null | awk '{print $1}' | tr -d '[:space:]' || true)
 actual_digest=$(ob_sha256_hex "${tmp_tar}")
 if [[ -z "${expected_digest}" ]] || [[ ! "${expected_digest}" =~ ^[a-f0-9]{64}$ ]]; then
-    log_error "Release digest file missing or malformed"
-    rm -f "${tmp_tar}"
-    exit 1
+    # .sha256 file not available on static-serve host (404) — fall back to baked hash.
+    # This happens on Coolify static deployments that don't pick up non-git-tracked files.
+    if [[ -n "${OB_BAKED_SHA256:-}" ]]; then
+        expected_digest="${OB_BAKED_SHA256}"
+        log_warn "Release digest file (.sha256) not available — using baked SHA256 for integrity check."
+    else
+        log_error "Release digest file missing or malformed and no baked SHA256 available."
+        rm -f "${tmp_tar}"
+        exit 1
+    fi
 fi
 if [[ -z "${actual_digest}" ]]; then
     log_warn "No sha256 tool available — skipping integrity check."
