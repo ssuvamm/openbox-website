@@ -2549,7 +2549,7 @@ cmd_reset() {
             echo "This will:"
             echo "  - Stop all OpenBox containers"
             echo "  - Remove all ob-* containers"
-            echo "  - Remove sb_* Docker networks"
+            echo "  - Remove ob_* Docker networks"
             echo "  - KEEP: /data, .env, state, backups, and the install directory"
             echo ""
             echo "After this, 'openbox up' will start everything fresh."
@@ -2604,9 +2604,9 @@ cmd_reset() {
         done <<< "${containers}"
     fi
 
-    log_info "Removing sb_* Docker networks..."
+    log_info "Removing ob_* Docker networks..."
     local networks
-    networks=$(docker network ls --filter "name=sb_" --format "{{.Name}}" 2>/dev/null || true)
+    networks=$(docker network ls --filter "name=ob_" --filter "name=sb_" --format "{{.Name}}" 2>/dev/null || true)
     if [[ -n "${networks}" ]]; then
         while IFS= read -r network; do
             [[ -z "${network}" ]] && continue
@@ -2728,7 +2728,7 @@ cmd_factory_reset() {
     echo ""
     echo "This will:"
     echo "  - Stop all OpenBox containers"
-    echo "  - Remove ob-* containers and sb_* networks"
+    echo "  - Remove ob-* containers and ob_* networks"
     echo "  - Wipe state/ (chat sessions, module API keys, wizard state, etc.)"
     echo "  - Wipe every module's config/ and data/ subdirectory"
     echo "  - Reset modules.conf back to core-only"
@@ -2767,9 +2767,9 @@ cmd_factory_reset() {
         done <<< "${containers}"
     fi
 
-    log_info "Removing sb_* Docker networks..."
+    log_info "Removing ob_* Docker networks..."
     local networks
-    networks=$(docker network ls --filter "name=sb_" --format "{{.Name}}" 2>/dev/null || true)
+    networks=$(docker network ls --filter "name=ob_" --filter "name=sb_" --format "{{.Name}}" 2>/dev/null || true)
     if [[ -n "${networks}" ]]; then
         while IFS= read -r network; do
             [[ -z "${network}" ]] && continue

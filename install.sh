@@ -16,7 +16,7 @@ set -euo pipefail
 OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://openbox.crushcodeworks.com/openbox.tar.gz}"
 # Baked SHA256 of the release tarball. Used when the .sha256 fetch fails or returns malformed data.
 # Computed at build time. Must match the tarball at the above URL.
-OB_BAKED_SHA256="caf23b9e4794cd1b819caf28dbfc47d278d2ead6879761c1beedea697cbc7863"
+OB_BAKED_SHA256="46c5a8884ef600fc3d07947fceb13ac35e26946bf291f43a37c8fc866ca20535"
 VERSION_URL="https://openbox.crushcodeworks.com/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
@@ -1130,13 +1130,13 @@ else
             echo "OB_HOST_IP=${OB_HOST_IP_VALUE:-127.0.0.1}"
             echo "OB_DOMAIN=${OB_HOST_IP_VALUE:-127.0.0.1}"
             echo "TZ=${TZ:-UTC}"
-            sb_puid_val="${SUDO_UID:-1000}"
-            sb_pgid_val="${SUDO_GID:-1000}"
-            [[ "${sb_puid_val}" -lt 1 ]] && sb_puid_val=1000
-            [[ "${sb_pgid_val}" -lt 1 ]] && sb_pgid_val=1000
-            echo "PUID=${sb_puid_val}"
-            echo "PGID=${sb_pgid_val}"
-            unset sb_puid_val sb_pgid_val
+            ob_puid_val="${SUDO_UID:-1000}"
+            ob_pgid_val="${SUDO_GID:-1000}"
+            [[ "${ob_puid_val}" -lt 1 ]] && ob_puid_val=1000
+            [[ "${ob_pgid_val}" -lt 1 ]] && ob_pgid_val=1000
+            echo "PUID=${ob_puid_val}"
+            echo "PGID=${ob_pgid_val}"
+            unset ob_puid_val ob_pgid_val
             echo "OB_DATA_DIR=${OB_DATA_DIR_VALUE}"
             echo "MEDIA_ROOT=${OB_DATA_DIR_VALUE}/media"
             echo ""
@@ -1394,9 +1394,9 @@ AUTHUSERS
     if [[ -n "${QBIT_ADMIN_PW}" ]]; then
         QBIT_PW_LINE=""
         if python3 -c "import hashlib,secrets,base64" >/dev/null 2>&1; then
-            QBIT_PW_LINE=$(SB_QBIT_PW="${QBIT_ADMIN_PW}" python3 -c "
+            QBIT_PW_LINE=$(OB_QBIT_PW="${QBIT_ADMIN_PW}" python3 -c "
 import os, hashlib, secrets, base64
-pw = os.environ['SB_QBIT_PW'].encode()
+pw = os.environ['OB_QBIT_PW'].encode()
 salt = secrets.token_bytes(16)
 h = hashlib.pbkdf2_hmac('sha512', pw, salt, 100000, 64)
 print('@ByteArray(' + base64.b64encode(salt).decode() + ':' + base64.b64encode(h).decode() + ')')" 2>/dev/null || true)
