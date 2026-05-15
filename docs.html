@@ -197,10 +197,10 @@ ssh root@YOUR_SERVER_IP
 apt update && apt upgrade -y
 
 # Step 3: Run the installer
-curl -fsSL https://openbox.crushcodeworks.com/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/ssuvamm/openbox-website/main/install.sh | sudo bash
 
 # Or inspect before running:
-curl -fsSL https://openbox.crushcodeworks.com/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/ssuvamm/openbox-website/main/install.sh -o install.sh
 less install.sh
 sudo bash install.sh</code></pre>
 
@@ -229,7 +229,7 @@ docker compose version
 curl -fsSL https://get.docker.com | sh</code></pre>
       </li>
       <li><strong>Install OpenBox:</strong>
-        <pre><code>curl -fsSL https://openbox.crushcodeworks.com/install.sh | sudo bash</code></pre>
+        <pre><code>curl -fsSL https://raw.githubusercontent.com/ssuvamm/openbox-website/main/install.sh | sudo bash</code></pre>
       </li>
     </ol>
 
@@ -249,7 +249,7 @@ curl -fsSL https://get.docker.com | sh</code></pre>
 
     <pre><code># Install Ubuntu from Microsoft Store, then:
 wsl -d Ubuntu
-curl -fsSL https://openbox.crushcodeworks.com/install.sh | sudo bash</code></pre>
+curl -fsSL https://raw.githubusercontent.com/ssuvamm/openbox-website/main/install.sh | sudo bash</code></pre>
 
     <div class="callout info">
       <strong>Docker on WSL2</strong>

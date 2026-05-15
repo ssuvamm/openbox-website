@@ -13,11 +13,11 @@ set -euo pipefail
 # Note: deliberately NOT named DOWNLOAD_URL — that collides with the
 # variable Docker's own get-docker.sh uses for its repo base URL, and
 # Docker will pick up our override and try to fetch its GPG key from it.
-OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://openbox.crushcodeworks.com/openbox.tar.gz}"
+OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://raw.githubusercontent.com/ssuvamm/openbox-website/main/openbox.tar.gz}"
 # Baked SHA256 of the release tarball. Used when the .sha256 fetch fails or returns malformed data.
 # Computed at build time. Must match the tarball at the above URL.
 OB_BAKED_SHA256="d4f35e638328553e68e41cf8aa9756f063e2df8c240d907f8a1a742095207432"
-VERSION_URL="https://openbox.crushcodeworks.com/version.txt"
+VERSION_URL="https://raw.githubusercontent.com/ssuvamm/openbox-website/main/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
 # shipped copy of install.sh at release time.
