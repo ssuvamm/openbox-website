@@ -3372,81 +3372,6 @@ cmd_urls() {
     done
 }
 
-cmd_reset_lock() {
-    banner
-    local lock_file="${OB_ROOT}/state/operation.lock"
-    if [[ -f "${lock_file}" ]]; then
-        rm -f "${lock_file}"
-        echo -e "${GREEN}Removed operation lock: ${lock_file}${NC}"
-    else
-        echo -e "${YELLOW}No operation lock found.${NC}"
-    fi
-    echo ""
-    echo "You can now run 'openbox up' or 'openbox install' again."
-}
-
-cmd_uninstall() {
-    local keep_env=false auto_yes=false
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --keep-env) keep_env=true; shift ;;
-            --yes) auto_yes=true; shift ;;
-            *) echo "Usage: openbox uninstall [--keep-env] [--yes]"; exit 1 ;;
-        esac
-    done
-
-    banner
-    echo -e "${YELLOW}Uninstalling OpenBox from ${OB_ROOT}${NC}"
-    echo ""
-    if [[ "${auto_yes}" != "true" ]]; then
-        echo -ne "${BOLD}Are you sure? [y/N]: ${NC}"
-        read -r confirm
-        if [[ ! "${confirm}" =~ ^[Yy]$ ]]; then
-            echo "Aborted."
-            exit 0
-        fi
-    fi
-
-    # Stop everything first
-    echo "Stopping all containers..."
-    if [[ -x "${OB_ROOT}/openbox" ]]; then
-        "${OB_ROOT}/openbox" down >/dev/null 2>&1 || true
-    fi
-
-    # Remove Docker networks
-    echo "Cleaning Docker networks (ob_*)..."
-    for net in $(docker networks ls --format '{{.Name}}' 2>/dev/null | grep '^ob_'); do
-        docker network rm "${net}" >/dev/null 2>&1 || true
-    done
-
-    # Backup .env if --keep-env
-    local env_backup=""
-    if [[ "${keep_env}" == "true" ]] && [[ -f "${OB_ROOT}/.env" ]]; then
-        env_backup="/tmp/openbox-env-backup-$(date +%s).txt"
-        cp "${OB_ROOT}/.env" "${env_backup}"
-        echo "Backed up .env to ${env_backup}"
-    fi
-
-    # Remove everything under OB_ROOT EXCEPT data/ and the backed-up .env
-    echo "Removing ${OB_ROOT}..."
-    rm -rf "${OB_ROOT:?}" 2>/dev/null || true
-
-    # Remove symlink
-    if [[ -L /usr/local/bin/openbox ]]; then
-        rm -f /usr/local/bin/openbox
-    fi
-
-    echo ""
-    echo -e "${GREEN}OpenBox removed from ${OB_ROOT}${NC}"
-    if [[ -n "${env_backup}" ]]; then
-        echo "Your .env was preserved at: ${env_backup}"
-        echo "Run the installer again to reinstall with the same config:"
-        echo "  curl -fsSL https://openbox.crushcodeworks.com/install.sh | bash"
-    else
-        echo "To reinstall: curl -fsSL https://openbox.crushcodeworks.com/install.sh | bash"
-    fi
-}
-
 cmd_install() {
     if [[ -f "${OB_ROOT}/scripts/setup.sh" ]]; then
         banner
@@ -4263,11 +4188,6 @@ cmd_help() {
     echo "  support {enable|disable|status}"
     echo "                       Open a 4-hour remote-support session via Tailscale"
     echo "                       so Tom can SSH in to debug. Auto-revokes."
-    echo "  uninstall [--keep-env] [--yes]"
-    echo "                       Remove OpenBox. --keep-env preserves .env"
-    echo "                       for a clean reinstall. --yes skips confirm."
-    echo "  reset-lock           Clear the first-claim operation lock"
-    echo "                       (run this if the dashboard is stuck on first login)"
     echo "  help                 Show this help"
     echo ""
     echo -e "${BOLD}Modules:${NC}"
@@ -4292,8 +4212,6 @@ main() {
     shift 2>/dev/null || true
 
     case "${command}" in
-        uninstall)     cmd_uninstall "$@" ;;
-        reset-lock)    cmd_reset_lock "$@" ;;
         install)  cmd_install "$@" ;;
         up)       cmd_up "$@" ;;
         down)     cmd_down "$@" ;;
