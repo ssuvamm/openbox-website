@@ -16,7 +16,7 @@ set -euo pipefail
 OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://openbox.crushcodeworks.com/openbox.tar.gz}"
 # Baked SHA256 of the release tarball. Used when the .sha256 fetch fails or returns malformed data.
 # Computed at build time. Must match the tarball at the above URL.
-OB_BAKED_SHA256="46c5a8884ef600fc3d07947fceb13ac35e26946bf291f43a37c8fc866ca20535"
+OB_BAKED_SHA256="4dc02b90457706177739ad0f2110924452f071dec0ab5e29209a0475f8270f93"
 VERSION_URL="https://openbox.crushcodeworks.com/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
