@@ -16,7 +16,7 @@ set -euo pipefail
 OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://raw.githubusercontent.com/ssuvamm/openbox-website/main/openbox.tar.gz}"
 # Baked SHA256 of the release tarball. Used when the .sha256 fetch fails or returns malformed data.
 # Computed at build time. Must match the tarball at the above URL.
-OB_BAKED_SHA256="029e4f9d636732c92e587e0aceb06f68cd6d9ab3703fe9ede5c18d6aa38e6348"
+OB_BAKED_SHA256="77507f465ebcb12d0c35102e5bb44701e5756ff0550c7dc1cffa528e8254d893"
 VERSION_URL="https://raw.githubusercontent.com/ssuvamm/openbox-website/main/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
@@ -421,15 +421,22 @@ DNSStubListener=no
 DNS=1.1.1.1 9.9.9.9
 EOF
     systemctl restart systemd-resolved 2>/dev/null || true
+    # WSL2 manages /etc/resolv.conf via Windows DNS bridge — symlink is protected.
+    # Skip on WSL; the stub listener config above is sufficient.
+    if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+        log_ok "Port 53 freed (WSL2: skipping resolv.conf symlink — managed by Windows)"
+        return 0
+    fi
     if [[ -f /run/systemd/resolve/resolv.conf ]]; then
         if [[ -f /etc/resolv.conf && ! -L /etc/resolv.conf ]]; then
             local _resolv_backup="/etc/resolv.conf.openbox-backup-$(date +%s)"
             mv /etc/resolv.conf "${_resolv_backup}" 2>/dev/null \
                 && log_info "Existing /etc/resolv.conf backed up to ${_resolv_backup}"
         else
-            rm -f /etc/resolv.conf
+            rm -f /etc/resolv.conf 2>/dev/null || true
         fi
-        ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf
+        ln -sf /run/systemd/resolve/resolv.conf /etc/resolv.conf 2>/dev/null || \
+            log_warn "Could not symlink /etc/resolv.conf — DNS may fall back to Windows host DNS"
     fi
     log_ok "Port 53 freed; host DNS now uses 1.1.1.1 / 9.9.9.9 upstream"
 }
