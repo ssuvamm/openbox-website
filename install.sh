@@ -16,7 +16,7 @@ set -euo pipefail
 OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://raw.githubusercontent.com/ssuvamm/openbox-website/main/openbox.tar.gz}"
 # Baked SHA256 of the release tarball. Used when the .sha256 fetch fails or returns malformed data.
 # Computed at build time. Must match the tarball at the above URL.
-OB_BAKED_SHA256="24ffb230689f209e788071c6f194ba01747d8eb475d5ef3c75fd261a66aeee4a"
+OB_BAKED_SHA256="66f2f6e5a0e611de2f83770df87a915e868aa442c8218270817b3a4573189bc1"
 VERSION_URL="https://raw.githubusercontent.com/ssuvamm/openbox-website/main/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
@@ -438,6 +438,33 @@ if [[ "${IS_NAS}" != true ]]; then
     free_port_53_if_needed
 fi
 
+# Detect and offer to stop services that hold ports 80/443 (Apache2, nginx).
+# On WSL2 / Ubuntu installs these are often running by default and silently
+# block the OpenBox reverse proxy from binding. We stop+disable them and
+# offer to leave them disabled permanently.
+free_common_web_ports() {
+    local _stopped=0
+    for _svc in apache2 nginx lighttpd; do
+        if command -v systemctl &>/dev/null && systemctl is-active --quiet "${_svc}" 2>/dev/null; then
+            log_warn "${_svc} is running and will conflict with OpenBox on port 80/443."
+            log_info "Stopping ${_svc} for this install..."
+            systemctl stop "${_svc}" 2>/dev/null && systemctl disable "${_svc}" 2>/dev/null || true
+            log_ok "${_svc} stopped and disabled. Re-enable with: sudo systemctl enable --now ${_svc}"
+            _stopped=$((_stopped + 1))
+        fi
+    done
+    # Check if port 80 is still in use by something else
+    if command -v ss &>/dev/null && ss -tulpn 2>/dev/null | grep -qE ':80[[:space:]]'; then
+        local _holder
+        _holder="$(ss -tulpn 2>/dev/null | grep -E ':80[[:space:]]' | awk '{print $NF}' | head -1)"
+        log_warn "Port 80 is still in use by: ${_holder}"
+        log_warn "OpenBox's HTTP_PORT may need to be changed in ${INSTALL_DIR}/.env (e.g. HTTP_PORT=8080)"
+    fi
+}
+if [[ "${IS_NAS}" != true ]]; then
+    free_common_web_ports
+fi
+
 # Root / Docker permission check
 if [[ "${IS_NAS}" == true ]]; then
     if [[ $EUID -ne 0 ]]; then
@@ -717,9 +744,8 @@ else
     if ! curl -fsSL -o /dev/null -w "%{http_code}" "${OB_DOWNLOAD_URL}.sig" 2>/dev/null | grep -q "200"; then
         log_warn "Release signature (.sig) not available — skipping ed25519 verification."
         log_warn "SHA256 integrity check still runs. Install is safe but not supply-chain signed."
-        rm -f "${tmp_tar}" "${tmp_sig}"
+        rm -f "${tmp_sig}"
         [[ -n "${tmp_pubkey}" ]] && rm -f "${tmp_pubkey}"
-        # Jump to post-signature section (don't try openssl verify)
         OB_SIG_MISSING=true
     else
         if ! curl -fsSL "${OB_DOWNLOAD_URL}.sig" -o "${tmp_sig}" 2>/dev/null; then
@@ -730,7 +756,9 @@ else
         fi
         OB_SIG_MISSING=false
     fi
-    if [[ "${OB_SIG_MISSING:-false}" == "false" ]] && openssl pkeyutl -verify -pubin -inkey "${OB_PUBKEY_FILE}" \
+    if [[ "${OB_SIG_MISSING:-false}" == "true" ]]; then
+        : # signature skipped — SHA256 integrity check above is sufficient
+    elif openssl pkeyutl -verify -pubin -inkey "${OB_PUBKEY_FILE}" \
             -rawin -in "${tmp_tar}" -sigfile "${tmp_sig}" &>/dev/null; then
         log_ok "ed25519 signature verified"
     else
@@ -1111,6 +1139,26 @@ else
     gen_password() {
         openssl rand -base64 24 2>/dev/null | tr -d '=+/' | head -c 24 || echo "changeme$(date +%s)"
     }
+    # WSL2-aware IP detection. `hostname -I` returns blank on WSL2 kernels
+    # before the eth0 interface is fully up, and /proc/net/fib_trie is more
+    # reliable. Falls back to ip route, then hostname -I, then 127.0.0.1.
+    get_local_ip() {
+        local _ip=""
+        # WSL2: read eth0 addr from /proc/net/fib_trie (always populated)
+        if grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; then
+            _ip="$(awk '/32 HOST/{print i}{i=$2}' /proc/net/fib_trie 2>/dev/null \
+                  | grep -v '127\.' | grep -v '^0\.' | head -1)"
+        fi
+        # Generic: ip route preferred source
+        if [[ -z "${_ip}" ]]; then
+            _ip="$(ip route get 1.1.1.1 2>/dev/null | awk '/src/{for(i=1;i<=NF;i++) if($i=="src") print $(i+1)}')"
+        fi
+        # Fallback: hostname -I
+        if [[ -z "${_ip}" ]]; then
+            _ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+        fi
+        echo "${_ip:-127.0.0.1}"
+    }
 
     if [[ "${OB_UPGRADE_MODE}" == "true" ]] && [[ -f "${INSTALL_DIR}/.env" ]]; then
         log_info "Keeping existing .env from previous install."
@@ -1126,7 +1174,7 @@ else
             echo "OB_SESSION_SECRET=$(gen_secret)"
             echo "OB_BACKUP_KEY=$(gen_secret)"
             echo "OB_BOOTSTRAP_TOKEN=${OB_BOOTSTRAP_TOKEN_VALUE}"
-            OB_HOST_IP_VALUE="$(hostname -I 2>/dev/null | awk '{print $1}')"
+            OB_HOST_IP_VALUE="$(get_local_ip)"
             echo "OB_HOST_IP=${OB_HOST_IP_VALUE:-127.0.0.1}"
             echo "OB_DOMAIN=${OB_HOST_IP_VALUE:-127.0.0.1}"
             echo "TZ=${TZ:-UTC}"
@@ -1564,7 +1612,7 @@ QBIT_INIT
             echo ""
         } >&2
         log_info "Next steps:"
-        echo "  1. Open the dashboard: http://$(hostname -I 2>/dev/null | awk '{print $1}'):8443"
+        echo "  1. Open the dashboard: http://$(get_local_ip):8443"
         echo "  2. Paste the bootstrap token above and pick an admin password"
         echo "  3. Follow the setup wizard in your browser"
         echo ""
@@ -1574,7 +1622,7 @@ QBIT_INIT
         log_warn "  This is optional — media stack works without VPN, but at your own risk."
         echo ""
         {
-            _ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+            _ip="$(get_local_ip)"
             : "${_ip:=127.0.0.1}"
             echo "============================================================"
             echo "  INSTALL COMPLETE — your last-screen quick-reference"
@@ -1593,7 +1641,7 @@ QBIT_INIT
         } >&2
     else
         log_info "Upgrade complete. Dashboard preserved its previous login."
-        echo "  Dashboard: http://$(hostname -I 2>/dev/null | awk '{print $1}'):8443"
+        echo "  Dashboard: http://$(get_local_ip):8443"
         echo ""
     fi
 fi

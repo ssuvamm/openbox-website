@@ -684,6 +684,24 @@ run_compose() {
 # keys, which fails with "cannot override x-openbox.tips" when modules
 # define that key with different shapes. Per-module invocation also means
 # one broken module doesn't block the others.
+# Returns "vpn" if VPN credentials are configured in .env, "novpn" otherwise.
+# Used to pass --profile vpn/novpn to docker compose for the media module.
+# VPN is optional: without it, downloads run directly (no encryption).
+get_media_vpn_profile() {
+    local vpn_provider="" vpn_type="" wg_key="" vpn_user=""
+    if [[ -f "${OB_ENV_FILE}" ]]; then
+        vpn_provider="$(grep '^VPN_PROVIDER=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)"
+        vpn_type="$(grep '^VPN_TYPE=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)"
+        wg_key="$(grep '^WIREGUARD_PRIVATE_KEY=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)"
+        vpn_user="$(grep '^VPN_USER=' "${OB_ENV_FILE}" 2>/dev/null | tail -1 | cut -d= -f2-)"
+    fi
+    [[ -z "${vpn_provider}" ]] && { echo "novpn"; return; }
+    case "${vpn_type:-wireguard}" in
+        wireguard) [[ -n "${wg_key}" ]] && echo "vpn" || echo "novpn" ;;
+        *) [[ -n "${vpn_user}" ]] && echo "vpn" || echo "novpn" ;;
+    esac
+}
+
 run_compose_per_module() {
     local subcmd="$1"; shift
     local rc=0
@@ -711,10 +729,15 @@ run_compose_per_module() {
             log_warn "Compose file not found for module: ${module}"
             continue
         fi
+        # Media module uses docker compose profiles to toggle VPN on/off.
+        local _profile_args=()
+        if [[ "${module}" == "media" ]]; then
+            _profile_args=(--profile "$(get_media_vpn_profile)")
+        fi
         if [[ -f "${OB_ENV_FILE}" ]]; then
-            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" "${subcmd}" "$@" || rc=$?
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" "${_profile_args[@]}" "${subcmd}" "$@" || rc=$?
         else
-            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose -p openbox -f "${compose_file}" "${subcmd}" "$@" || rc=$?
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose -p openbox -f "${compose_file}" "${_profile_args[@]}" "${subcmd}" "$@" || rc=$?
         fi
     done
     return $rc
@@ -1260,10 +1283,15 @@ cmd_up() {
             log_error "Compose file not found for module: ${target_module}"
             exit 1
         fi
+        # Media module uses docker compose profiles for VPN-optional routing.
+        local _single_profile_args=()
+        if [[ "${target_module}" == "media" ]]; then
+            _single_profile_args=(--profile "$(get_media_vpn_profile)")
+        fi
         if [[ -f "${OB_ENV_FILE}" ]]; then
-            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose --env-file "${OB_ENV_FILE}" -p openbox -f "${compose_file}" "${_single_profile_args[@]}" up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
         else
-            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose -p openbox -f "${compose_file}" up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
+            OB_ROOT="${OB_HOST_ROOT}" COMPOSE_IGNORE_ORPHANS=True docker compose -p openbox -f "${compose_file}" "${_single_profile_args[@]}" up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
         fi
     else
         run_compose_per_module up -d "${force_recreate_args[@]}" "$@" || _up_rc=$?
