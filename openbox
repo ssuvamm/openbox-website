@@ -2099,7 +2099,7 @@ cmd_status() {
     echo ""
     echo -e "${BOLD}Container Status:${NC}"
     echo ""
-    docker ps --filter "name=sb-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || \
+    docker ps --filter "name=ob-" --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null || \
         log_warn "Could not query Docker. Is Docker running?"
 }
 
@@ -2536,7 +2536,7 @@ _save_pre_update_digests() {
             json+=","
         fi
         json+="\"${name}\":{\"image\":\"${image}\",\"imageId\":\"${imageId}\"}"
-    done < <(docker ps --filter "name=sb-" --format "{{.Names}}\t{{.Image}}\t{{.ID}}" 2>/dev/null)
+    done < <(docker ps --filter "name=ob-" --format "{{.Names}}\t{{.Image}}\t{{.ID}}" 2>/dev/null)
     json+="}"
 
     echo "${json}" > "${digest_file}"
@@ -2624,7 +2624,7 @@ cmd_reset() {
 
     log_info "Removing any remaining ob-* containers..."
     local containers
-    containers=$(docker ps -a --filter "name=sb-" --format "{{.Names}}" 2>/dev/null || true)
+    containers=$(docker ps -a --filter "name=ob-" --format "{{.Names}}" 2>/dev/null || true)
     if [[ -n "${containers}" ]]; then
         while IFS= read -r container; do
             [[ -z "${container}" ]] && continue
@@ -2701,7 +2701,7 @@ cmd_reset() {
                 | sort -u)
         fi
         local container_images
-        container_images=$(docker ps -a --filter 'name=^sb-' --format '{{.Image}}' 2>/dev/null | sort -u || true)
+        container_images=$(docker ps -a --filter 'name=^ob-' --format '{{.Image}}' 2>/dev/null | sort -u || true)
         images=$(printf '%s\n%s\n' "${images}" "${container_images}" | sort -u | grep -v '^$' || true)
         if [[ -n "${images}" ]]; then
             while IFS= read -r image; do
@@ -2787,7 +2787,7 @@ cmd_factory_reset() {
 
     log_info "Removing any remaining ob-* containers..."
     local containers
-    containers=$(docker ps -a --filter "name=sb-" --format "{{.Names}}" 2>/dev/null || true)
+    containers=$(docker ps -a --filter "name=ob-" --format "{{.Names}}" 2>/dev/null || true)
     if [[ -n "${containers}" ]]; then
         while IFS= read -r container; do
             [[ -z "${container}" ]] && continue
@@ -2842,11 +2842,19 @@ cmd_logs() {
 
     if [[ -z "${service}" ]]; then
         log_error "Usage: openbox logs <service>"
-        echo "Examples: openbox logs ob-pihole"
+        echo "Examples: openbox logs sonarr  OR  openbox logs ob-sonarr"
         exit 1
     fi
 
-    docker logs -f --tail 100 "${service}"
+    # Accept bare module names (e.g. "sonarr") by trying ob-<name> first
+    local target="${service}"
+    if [[ "${service}" != ob-* && "${service}" != sb-* ]]; then
+        if docker inspect "ob-${service}" &>/dev/null 2>&1; then
+            target="ob-${service}"
+        fi
+    fi
+
+    docker logs -f --tail 100 "${target}"
 }
 
 cmd_backup() {
@@ -3389,7 +3397,7 @@ cmd_urls() {
                 /^    [a-z]/ { svc=$1; sub(/:$/,"",svc) }
                 /port_map:/ && !/null/ { port=$2; }
                 /friendly_name:/ { gsub(/"/,"",$0); fname=""; for(i=2;i<=NF;i++) fname=fname (i>2?" ":"") $i }
-                /port_map:/ && !/null/ { print "sb-" svc " " port " " fname; fname="" }
+                /port_map:/ && !/null/ { print "ob-" svc " " port " " fname; fname="" }
             '
         )
 

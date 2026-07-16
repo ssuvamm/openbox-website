@@ -16,7 +16,7 @@ set -euo pipefail
 OB_DOWNLOAD_URL="${OB_DOWNLOAD_URL:-https://raw.githubusercontent.com/ssuvamm/openbox-website/main/openbox.tar.gz}"
 # Baked SHA256 of the release tarball. Used when the .sha256 fetch fails or returns malformed data.
 # Computed at build time. Must match the tarball at the above URL.
-OB_BAKED_SHA256="66f2f6e5a0e611de2f83770df87a915e868aa442c8218270817b3a4573189bc1"
+OB_BAKED_SHA256="029e4f9d636732c92e587e0aceb06f68cd6d9ab3703fe9ede5c18d6aa38e6348"
 VERSION_URL="https://raw.githubusercontent.com/ssuvamm/openbox-website/main/version.txt"
 
 # Public half of the OpenBox release signing key, baked into every
@@ -409,7 +409,7 @@ free_port_53_if_needed() {
     if ! command -v systemctl &>/dev/null; then return 0; fi
     if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then return 0; fi
     if command -v ss &>/dev/null; then
-        if ! ss -tulpn 2>/dev/null | grep -qE '[:.]53[[:space:]]'; then return 0; fi
+        if ! { ss -tulpn 2>/dev/null || true; } | grep -qE '[:.]53[[:space:]]'; then return 0; fi
     fi
     log_info "Freeing host port 53 for Pi-hole (disabling systemd-resolved stub listener)"
     mkdir -p /etc/systemd/resolved.conf.d
@@ -454,9 +454,10 @@ free_common_web_ports() {
         fi
     done
     # Check if port 80 is still in use by something else
-    if command -v ss &>/dev/null && ss -tulpn 2>/dev/null | grep -qE ':80[[:space:]]'; then
+    # Use { ... || true; } to guard against SIGPIPE from grep -q exiting early on busy boxes (set -o pipefail)
+    if command -v ss &>/dev/null && { ss -tulpn 2>/dev/null || true; } | grep -qE ':80[[:space:]]'; then
         local _holder
-        _holder="$(ss -tulpn 2>/dev/null | grep -E ':80[[:space:]]' | awk '{print $NF}' | head -1)"
+        _holder="$({ ss -tulpn 2>/dev/null || true; } | grep -E ':80[[:space:]]' | awk '{print $NF}' | head -1 || true)"
         log_warn "Port 80 is still in use by: ${_holder}"
         log_warn "OpenBox's HTTP_PORT may need to be changed in ${INSTALL_DIR}/.env (e.g. HTTP_PORT=8080)"
     fi
@@ -1037,7 +1038,7 @@ else
 
         # iptable_nat for WireGuard
         if [[ "${OB_TEST_MODE:-0}" != "1" ]]; then
-            if ! lsmod | grep -q '^iptable_nat'; then
+            if ! { lsmod 2>/dev/null || true; } | grep -q '^iptable_nat'; then
                 log_info "Loading iptable_nat kernel module (needed by WireGuard)..."
                 modprobe iptable_nat 2>/dev/null || log_warn "modprobe iptable_nat failed; wg-easy may not start"
             fi
@@ -1315,6 +1316,60 @@ VWINFO
              "${OB_DATA_DIR_VALUE}/manga" \
              "${OB_DATA_DIR_VALUE}/audiobooks" \
              "${OB_DATA_DIR_VALUE}/podcasts" 2>/dev/null || true
+
+    # Seed an empty Calibre library so calibre-web doesn't reject the folder on first run.
+    # calibre-web requires a valid metadata.db at the library path or it shows an error
+    # instead of a working UI. We create the minimal schema that calibre-web accepts.
+    if [[ ! -f "${OB_DATA_DIR_VALUE}/books/metadata.db" ]] && command -v python3 &>/dev/null; then
+        python3 - "${OB_DATA_DIR_VALUE}/books/metadata.db" <<'CALIBRE_SEED'
+import sys, sqlite3, os
+db_path = sys.argv[1]
+if os.path.exists(db_path):
+    sys.exit(0)
+conn = sqlite3.connect(db_path)
+c = conn.cursor()
+c.executescript("""
+CREATE TABLE IF NOT EXISTS metadata (key TEXT NOT NULL UNIQUE, val TEXT DEFAULT NULL);
+INSERT OR IGNORE INTO metadata VALUES('db_version','6');
+INSERT OR IGNORE INTO metadata VALUES('user_version','6');
+CREATE TABLE IF NOT EXISTS books (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    title TEXT NOT NULL DEFAULT 'Unknown',
+    sort TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    pubdate TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    series_index REAL NOT NULL DEFAULT 1.0,
+    author_sort TEXT,
+    isbn TEXT DEFAULT '',
+    lccn TEXT DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    flags INTEGER NOT NULL DEFAULT 1,
+    uuid TEXT,
+    has_cover BOOL DEFAULT 0,
+    last_modified TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS authors (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE, sort TEXT, link TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS books_authors_link (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, author INTEGER NOT NULL, UNIQUE(book,author));
+CREATE TABLE IF NOT EXISTS tags (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE);
+CREATE TABLE IF NOT EXISTS books_tags_link (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, tag INTEGER NOT NULL, UNIQUE(book,tag));
+CREATE TABLE IF NOT EXISTS series (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE, sort TEXT);
+CREATE TABLE IF NOT EXISTS books_series_link (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, series INTEGER NOT NULL, UNIQUE(book));
+CREATE TABLE IF NOT EXISTS publishers (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL COLLATE NOCASE UNIQUE, sort TEXT);
+CREATE TABLE IF NOT EXISTS books_publishers_link (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, publisher INTEGER NOT NULL, UNIQUE(book));
+CREATE TABLE IF NOT EXISTS languages (id INTEGER PRIMARY KEY AUTOINCREMENT, lang_code TEXT NOT NULL COLLATE NOCASE UNIQUE);
+CREATE TABLE IF NOT EXISTS books_languages_link (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, lang_code INTEGER NOT NULL, UNIQUE(book,lang_code));
+CREATE TABLE IF NOT EXISTS ratings (id INTEGER PRIMARY KEY AUTOINCREMENT, rating INTEGER CHECK(rating > -1 AND rating < 11) UNIQUE);
+CREATE TABLE IF NOT EXISTS books_ratings_link (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, rating INTEGER NOT NULL, UNIQUE(book));
+CREATE TABLE IF NOT EXISTS data (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, format TEXT NOT NULL COLLATE NOCASE, uncompressed_size INTEGER NOT NULL, name TEXT NOT NULL, UNIQUE(book,format));
+CREATE TABLE IF NOT EXISTS comments (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER UNIQUE NOT NULL, text TEXT NOT NULL DEFAULT '');
+CREATE TABLE IF NOT EXISTS custom_column_types (id INTEGER PRIMARY KEY AUTOINCREMENT);
+CREATE TABLE IF NOT EXISTS identifiers (id INTEGER PRIMARY KEY AUTOINCREMENT, book INTEGER NOT NULL, type TEXT NOT NULL COLLATE NOCASE DEFAULT 'isbn', val TEXT NOT NULL, UNIQUE(book,type));
+""")
+conn.commit()
+conn.close()
+CALIBRE_SEED
+        log_ok "Calibre library initialized at ${OB_DATA_DIR_VALUE}/books/metadata.db"
+    fi
 
     _puid_val="${SUDO_UID:-1000}"
     _pgid_val="${SUDO_GID:-1000}"
